@@ -1,0 +1,21 @@
+.pio/
+.DS_Store
+.vscode/
+release/
+
+# build outputs (service-install.syx is a checked-in deliverable)
+*.syx
+*.hex
+!service-install.syx
+
+# generated locally from your own uPD650C-085; never commit
+src/d650/image_embed.h
+
+# local reference material and captures
+*.pdf
+*.json
+docs/
+
+# notes stay local; README ships
+*.md
+!README.md

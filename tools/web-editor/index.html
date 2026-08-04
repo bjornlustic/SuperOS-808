@@ -1,0 +1,1281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SuperOS-808 Pattern Editor</title>
+<style>
+/* SuperOS house style, shared across the family's editors: Swiss
+   black-and-white, Helvetica Neue, 2px rules, no radius, uppercase
+   micro-labels, red for live. */
+:root{
+  --black:   #000000;
+  --white:   #ffffff;
+  --gray-1:  #f2f2f2;
+  --gray-2:  #e0e0e0;
+  --gray-3:  #b0b0b0;
+  --gray-4:  #606060;
+  --red:     #cc0000;
+  --blue:    #1668d6;
+  --green:   #1a7a3a;
+  --rule:    2px solid #000;
+  --rule-sm: 1px solid #000;
+  --font: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --mono: "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  background: var(--white); color: var(--black);
+  font-family: var(--font); font-size: 14px; font-weight: 500;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  font-synthesis: none;
+}
+::selection { background: #3300ff; color: #fff; }
+b, strong { font-weight: 800; letter-spacing: -0.005em; }
+.app { padding: clamp(16px,3vw,36px) clamp(16px,3vw,36px) clamp(24px,4vw,48px); max-width: 100%; overflow-x: hidden; }
+
+/* ── Header ── */
+.header {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: 8px 20px; padding-bottom: 12px; border-bottom: var(--rule); margin-bottom: 24px;
+}
+.logo { font-size: clamp(22px,5vw,30px); font-weight: 900; letter-spacing: -0.04em; text-transform: uppercase; line-height: 1; }
+.logo-sub { font-size: 11px; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase; color: var(--gray-4); align-self: flex-end; padding-bottom: 4px; }
+
+/* ── Banner ── */
+.banner { display: none; padding: 10px 14px; border: var(--rule); margin-bottom: 6px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; background: var(--black); color: var(--white); }
+.banner.visible { display: block; }
+.banner.is-warn { background: var(--red); }
+
+/* ── Control strips ── */
+.strip { display: flex; flex-wrap: wrap; align-items: stretch; border: var(--rule); margin-bottom: 6px; min-width: 0; }
+.group { display: flex; align-items: center; padding: 0 14px; border-right: var(--rule); min-width: 0; flex: 0 1 auto; }
+.group:last-child { border-right: none; }
+.group--grow { flex: 1 1 220px; min-width: min(100%,220px); }
+.group-inner { display: flex; align-items: center; gap: 6px; padding: 10px 0; flex-wrap: wrap; min-width: 0; }
+.lbl { font-size: 9px; font-weight: 900; letter-spacing: 0.18em; text-transform: uppercase; color: var(--gray-4); white-space: nowrap; padding-right: 10px; border-right: var(--rule-sm); margin-right: 10px; align-self: stretch; display: flex; align-items: center; }
+
+/* ── Inputs ── */
+input[type="number"], select {
+  height: 30px; padding: 0 8px; background: var(--white); border: var(--rule-sm);
+  color: var(--black); font-family: var(--font); font-size: 13px; font-weight: 600;
+  outline: none; border-radius: 0; appearance: none; transition: background 0.08s;
+}
+input[type="number"]:focus, select:focus { background: var(--black); color: var(--white); }
+input[type="number"] { width: 54px; text-align: center; }
+select { min-width: min(150px,100%); max-width: 100%; cursor: pointer; }
+input[type="file"] { display: none; }
+
+/* ── Buttons ── */
+.btn { height: 30px; padding: 0 14px; background: var(--white); border: var(--rule-sm); color: var(--black); font-family: var(--font); font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; cursor: pointer; white-space: nowrap; border-radius: 0; transition: background 0.08s, color 0.08s; }
+.btn:hover:not(:disabled) { background: var(--black); color: var(--white); }
+.btn:disabled { opacity: 0.25; cursor: default; }
+.btn-primary { background: var(--black); color: var(--white); border-color: var(--black); font-weight: 900; }
+.btn-primary:hover:not(:disabled) { background: var(--gray-4); border-color: var(--gray-4); }
+.btn-green { background: var(--green); color: var(--white); border-color: var(--green); font-weight: 900; }
+.btn-green:hover:not(:disabled) { background: #155e2d; border-color: #155e2d; }
+.btn-ghost { height: 30px; padding: 0 14px; background: var(--white); border: var(--rule-sm); color: var(--black); font-family: var(--font); font-size: 9px; font-weight: 900; letter-spacing: 0.18em; text-transform: uppercase; cursor: pointer; border-radius: 0; transition: background 0.08s, color 0.08s; }
+.btn-ghost:hover { background: var(--black); color: var(--white); }
+.btn-ghost.is-connected { background: var(--black); color: var(--white); }
+
+/* ── MIDI status ── */
+#midiStatus { font-size: 11px; font-weight: 600; color: var(--gray-3); letter-spacing: 0.02em; padding-left: 10px; }
+#midiStatus.is-ok { color: var(--black); }
+#midiStatus.is-warn { color: var(--red); font-weight: 700; }
+.chip { font-size: 9px; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase; border: var(--rule-sm); padding: 3px 7px; color: var(--gray-4); white-space: nowrap; }
+.chip.is-on { background: var(--black); color: var(--white); }
+.chip.is-warn { background: var(--red); color: var(--white); border-color: var(--red); }
+
+/* ── Variation tabs + pattern pills ── */
+.bank-group-bar { display: grid; grid-template-columns: 1fr; border: var(--rule); margin-bottom: 6px; min-width: 0; max-width: 100%; }
+.bank-group-bar .group-tabs { display: flex; flex-direction: row; border-bottom: var(--rule-sm); }
+.bank-group-bar .group-tab {
+  flex: 1 1 0; min-width: 0; min-height: 36px; padding: 0 6px;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  font-size: 9px; font-weight: 900; letter-spacing: 0.1em; text-transform: uppercase;
+  border-right: var(--rule-sm); background: var(--white); color: var(--gray-4);
+  transition: all 0.08s; user-select: none;
+}
+.bank-group-bar .group-tab:last-child { border-right: none; }
+.bank-group-bar .group-tab:hover:not(.is-active) { background: var(--gray-1); color: var(--black); }
+.bank-group-bar .group-tab.is-active { background: var(--black); color: var(--white); }
+.pat-pills { display: flex; gap: 0; min-width: 0; }
+.pat-pill {
+  flex: 1 1 0; min-width: 0; height: 36px; border: var(--rule-sm); margin-right: -1px;
+  background: var(--white); color: var(--gray-3); font-family: var(--mono);
+  font-size: 10px; font-weight: 700; cursor: pointer; display: flex;
+  align-items: center; justify-content: center; transition: all 0.08s;
+  border-radius: 0; position: relative; user-select: none;
+}
+.pat-pill:hover:not(.is-active) { background: var(--gray-1); color: var(--black); }
+.pat-pill.is-active { background: var(--black); border-color: var(--black); color: var(--white); z-index: 1; }
+.pat-pill.is-fill { color: var(--gray-4); }
+.pat-pill.is-fill.is-active { background: var(--red); border-color: var(--red); }
+.pat-pill.is-empty:not(.is-active) { color: var(--gray-3); }
+.pat-pill.is-full:not(.is-active) { box-shadow: inset 0 -2px 0 0 var(--black); color: var(--black); }
+.pat-pill.is-playing { animation: pill-blink 0.5s steps(1) infinite; }
+@keyframes pill-blink { 0%,100%{background:var(--white)} 50%{background:var(--gray-2)} }
+.pat-pill-badge { position: absolute; bottom: 1px; right: 2px; font-size: 6px; font-weight: 900; line-height: 1; opacity: 0.55; pointer-events: none; }
+
+/* ── Sequencer panel ── */
+.seq-panel { border: var(--rule); margin-bottom: 6px; min-width: 0; max-width: 100%; }
+.seq-toolbar { display: flex; align-items: center; padding: 10px 14px; border-bottom: var(--rule); flex-wrap: wrap; gap: 10px 14px; min-width: 0; }
+.seq-toolbar-lbl { font-size: 9px; font-weight: 900; letter-spacing: 0.18em; text-transform: uppercase; color: var(--gray-4); }
+.seq-hint { font-size: 11px; font-weight: 500; color: var(--gray-3); letter-spacing: 0.02em; flex: 1 1 240px; min-width: 0; }
+.seq-hint b { color: var(--black); font-weight: 700; }
+.seq-grid-wrap { padding: 8px; overflow-x: auto; -webkit-overflow-scrolling: touch; min-width: 0; max-width: 100%; }
+
+/* Part length steppers */
+.part-strip { display: flex; align-items: stretch; border-bottom: var(--rule); flex-wrap: wrap; }
+.part-cell { display: flex; align-items: center; gap: 0; padding: 8px 12px; border-right: var(--rule-sm); }
+.part-cell:last-child { border-right: none; }
+.part-name { font-size: 9px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; color: var(--gray-4); margin-right: 8px; white-space: nowrap; }
+.part-cell.is-super .part-name { color: var(--gray-3); }
+.len-adj-btn { width: 22px; height: 26px; padding: 0; border: var(--rule-sm); margin-right: -1px; background: var(--white); color: var(--black); font-size: 14px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.len-adj-btn:hover { background: var(--black); color: var(--white); }
+.len-num { min-width: 30px; height: 26px; border: var(--rule-sm); margin-right: -1px; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; background: var(--black); color: var(--white); user-select: none; }
+.len-num.is-zero { background: var(--white); color: var(--gray-3); font-weight: 400; font-style: italic; }
+
+/* ── Drum grid ──
+   Row label + N step cells. renderGrid sets grid-template-columns inline; the
+   rule below is only the initial 16-step template. Beat columns get a heavy left
+   rule, mirroring the step groups on the 808 panel; wider grids scroll inside
+   .seq-grid-wrap. */
+.drum-grid {
+  display: grid; width: 100%; min-width: 560px; box-sizing: border-box;
+  grid-template-columns: minmax(140px,170px) repeat(16, minmax(25px,1fr));
+  gap: 0; border-top: var(--rule-sm); border-left: var(--rule-sm);
+}
+.dg-hdr { border-right: var(--rule-sm); border-bottom: var(--rule-sm); background: var(--gray-1); font-size: 8px; font-weight: 900; letter-spacing: 0.04em; color: var(--gray-4); display: flex; align-items: center; justify-content: center; height: 18px; }
+.dg-hdr.is-beat { border-left: var(--rule); margin-left: -1px; color: var(--black); }
+.dg-hdr.is-partstart { background: var(--black); color: var(--white); }
+.dg-hdr.is-beyond { opacity: 0.35; }
+.dg-hdr.is-playing-col { background: var(--red); color: var(--white); opacity: 1; }
+.dg-corner { border-right: var(--rule); border-bottom: var(--rule-sm); background: var(--gray-1); font-size: 8px; font-weight: 900; letter-spacing: 0.16em; text-transform: uppercase; color: var(--gray-4); display: flex; align-items: center; padding: 0 6px; }
+.dg-rowlbl { display: flex; align-items: center; gap: 6px; min-width: 0; border-right: var(--rule); border-bottom: var(--rule-sm); padding: 3px 6px; user-select: none; }
+.dg-rowlbl.dg-row-ac { border-bottom: var(--rule); }
+.dg-abbr { font-size: 12px; font-weight: 900; letter-spacing: -0.02em; width: 24px; flex-shrink: 0; }
+.dg-rowlbl.dg-row-ac .dg-abbr { color: var(--red); }
+.dg-name { font-size: 8px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--gray-4); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dg-rowtools { display: flex; gap: 0; flex-shrink: 0; }
+.dg-tool { width: 18px; height: 20px; border: var(--rule-sm); margin-right: -1px; background: var(--white); color: var(--gray-3); font-size: 9px; font-weight: 900; cursor: pointer; font-family: var(--font); border-radius: 0; padding: 0; display: flex; align-items: center; justify-content: center; transition: all 0.08s; }
+.dg-tool:last-child { margin-right: 0; }
+.dg-tool:hover { background: var(--black); color: var(--white); }
+
+.dg-cell { height: 34px; min-width: 0; border-right: var(--rule-sm); border-bottom: var(--rule-sm); background: var(--white); cursor: pointer; position: relative; transition: background 0.05s; touch-action: none; }
+.dg-cell.dg-row-ac { border-bottom: var(--rule); }
+.dg-cell.is-beat { border-left: var(--rule); margin-left: -1px; }
+.dg-cell:hover { background: var(--gray-1); }
+.dg-cell.is-on { background: var(--black); }
+.dg-cell.is-on:hover { background: #222; }
+.dg-cell.dg-row-ac.is-on { background: var(--red); }
+.dg-cell.dg-row-ac.is-on:hover { background: #a50000; }
+.dg-cell.is-beyond { background: var(--gray-1); cursor: default; opacity: 0.45; }
+.dg-cell.is-playing-col { box-shadow: inset 3px 0 0 var(--red); }
+.dg-cell.is-playing-col:not(.is-on) { background: rgba(204,0,0,0.10); }
+
+/* ── Collapsible panels ── */
+.panel { border: var(--rule); margin-bottom: 6px; min-width: 0; max-width: 100%; }
+.panel-bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; user-select: none; border-bottom: 1px solid transparent; transition: background 0.08s; }
+.panel-bar:hover { background: var(--gray-1); }
+.panel-bar.is-open { border-bottom: var(--rule-sm); }
+.panel-bar-label { font-size: 9px; font-weight: 900; letter-spacing: 0.18em; text-transform: uppercase; color: var(--gray-4); }
+.panel-bar-arrow { font-size: 8px; color: var(--gray-3); display: inline-block; transition: transform 0.12s; }
+.panel-bar.is-open .panel-bar-arrow { transform: rotate(90deg); }
+.panel-bar-note { margin-left: auto; font-size: 10px; font-weight: 700; color: var(--gray-3); letter-spacing: 0.04em; }
+.panel-body { display: none; }
+.panel-body.is-open { display: block; }
+.panel-inner { padding: 14px; display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label { font-size: 9px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; color: var(--gray-4); }
+.note { font-size: 11px; font-weight: 500; color: var(--gray-4); line-height: 1.5; flex: 1 1 100%; }
+.note b { color: var(--black); }
+
+/* ── Rhythm track ── */
+.trk-grid { display: flex; flex-wrap: wrap; gap: 0; padding: 0 14px 14px; }
+.trk-cell { width: 46px; height: 34px; border: var(--rule-sm); margin: 0 -1px -1px 0; background: var(--white); font-family: var(--mono); font-size: 10px; font-weight: 700; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; line-height: 1.1; transition: all 0.08s; }
+.trk-cell:hover { background: var(--gray-1); }
+.trk-cell.is-fill { color: var(--red); }
+.trk-cell .trk-num { font-size: 6px; font-weight: 900; color: var(--gray-3); letter-spacing: 0.04em; }
+
+/* ── Calibration ── */
+.cal-list { border-top: var(--rule-sm); }
+.cal-step { display: flex; align-items: center; gap: 10px; padding: 7px 14px; border-bottom: 1px solid var(--gray-1); font-size: 12px; }
+.cal-step:last-child { border-bottom: none; }
+.cal-step.is-on { background: var(--black); color: var(--white); font-weight: 700; }
+.cal-step.is-on .cal-idx { color: rgba(255,255,255,0.5); }
+.cal-step.is-done { color: var(--gray-4); }
+.cal-idx { font-family: var(--mono); font-size: 9px; font-weight: 900; color: var(--gray-3); width: 22px; flex-shrink: 0; }
+.cal-txt { flex: 1; min-width: 0; }
+.cal-val { font-family: var(--mono); font-size: 11px; font-weight: 900; letter-spacing: 0.2em; }
+.cal-step.is-done .cal-val { color: var(--black); }
+.live-nib { font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: 0.18em; }
+
+/* ── Progress ── */
+.bar-outer { width: 220px; height: 12px; border: var(--rule-sm); background: var(--gray-1); }
+.bar-inner { height: 100%; background: var(--black); width: 0%; transition: width 0.15s; }
+
+/* ── Log ── */
+#log { font-family: var(--mono); font-size: 11px; font-weight: 500; background: var(--gray-1); padding: 12px 14px; height: clamp(120px,25vh,220px); overflow: auto; white-space: pre-wrap; color: var(--gray-4); line-height: 1.9; letter-spacing: 0.02em; }
+.log-note { color: var(--black); font-weight: 700; }
+.log-err  { color: var(--red); font-weight: 700; }
+.log-ack  { color: var(--gray-4); }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header class="header">
+    <div class="logo">SuperOS&#x2011;808</div>
+    <div class="logo-sub">Pattern Editor</div>
+  </header>
+
+  <div class="banner" id="httpBanner">
+    &#9632;&nbsp; Opened as a file &mdash; Web MIDI SysEx needs http://localhost. In VS Code / Cursor press
+    <strong>F5</strong> and pick <strong>808 Web Editor</strong>, or run:
+    npx live-server tools/web-editor --port=3000
+  </div>
+  <div class="banner is-warn" id="emuBanner">
+    &#9632;&nbsp; Connected, but the 808 is not answering. It is almost certainly running the
+    <strong>&micro;PD650C emulator</strong>, which ignores editor SysEx &mdash; the editor only talks to
+    SuperOS. &nbsp;
+    <button class="btn" id="btnToSuperOS" style="margin-left:8px">Switch to SuperOS</button>
+  </div>
+  <div class="banner is-warn" id="calBanner">
+    &#9632;&nbsp; This 808 is running the default panel table &mdash; open <strong>Panel calibration</strong> below and run it before trusting the rotaries.
+  </div>
+
+  <!-- MIDI connection -->
+  <div class="strip">
+    <div class="group">
+      <div class="group-inner">
+        <button class="btn-ghost" id="btnMidi">Connect MIDI</button>
+        <button class="btn" id="btnIdentify" disabled>Identify</button>
+        <!-- Also present at the bottom of the firmware panel, but that is below
+             the fold and easy to miss: firmware switching is a top-level action. -->
+        <button class="btn" id="btnEmuTop" disabled title="Reboot the 808 into the &micro;PD650C emulator">Boot emulator</button>
+        <span id="midiStatus">Not connected</span>
+      </div>
+    </div>
+    <div class="group">
+      <span class="lbl">Out &#8594; 808</span>
+      <div class="group-inner"><select id="selOut" disabled></select></div>
+    </div>
+    <div class="group">
+      <span class="lbl">808 &#8594; In</span>
+      <div class="group-inner"><select id="selIn" disabled></select></div>
+    </div>
+    <div class="group group--grow">
+      <div class="group-inner">
+        <span class="chip" id="chipFw">firmware &mdash;</span>
+        <span class="chip" id="chipStore">storage &mdash;</span>
+        <span class="chip" id="chipEmu">emulator &mdash;</span>
+        <span class="chip" id="chipCal">panel &mdash;</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Device transfer -->
+  <div class="strip">
+    <div class="group">
+      <span class="lbl">From 808</span>
+      <div class="group-inner">
+        <button class="btn" id="btnReq" disabled>&#8595; Pattern</button>
+        <button class="btn" id="btnReqAll" disabled>&#8595; Everything</button>
+      </div>
+    </div>
+    <div class="group">
+      <span class="lbl">To 808</span>
+      <div class="group-inner">
+        <button class="btn btn-primary" id="btnSendPat" disabled>&#8593; Pattern</button>
+        <button class="btn" id="btnSendAll" disabled>&#8593; Everything</button>
+      </div>
+    </div>
+    <div class="group">
+      <span class="lbl">Pre&nbsp;Scale</span>
+      <div class="group-inner"><select id="preSel">
+        <option value="0">1 &mdash; 3 steps / beat</option>
+        <option value="1">2 &mdash; 6 steps / beat</option>
+        <option value="2" selected>3 &mdash; 4 steps / beat</option>
+        <option value="3">4 &mdash; 8 steps / beat</option>
+      </select></div>
+    </div>
+    <div class="group group--grow">
+      <span class="lbl">JSON</span>
+      <div class="group-inner">
+        <button class="btn" id="btnSaveJson">&#8595; Save all</button>
+        <button class="btn" id="btnLoadJson">&#8593; Load</button>
+        <input type="file" id="fileJson" accept=".json,application/json">
+      </div>
+    </div>
+  </div>
+
+  <!-- Variation tabs + pattern pills -->
+  <div class="bank-group-bar">
+    <div class="group-tabs" id="varTabs">
+      <div class="group-tab is-active" data-var="0">Variation A</div>
+      <div class="group-tab" data-var="1">Variation B</div>
+    </div>
+    <div class="pat-pills" id="patPills"></div>
+  </div>
+
+  <!-- Sequencer -->
+  <div class="seq-panel">
+    <div class="seq-toolbar">
+      <span class="seq-toolbar-lbl" id="patTitle">Basic Rhythm 1 A</span>
+      <span class="seq-hint" id="seqHint"></span>
+    </div>
+    <div class="part-strip" id="partStrip"></div>
+    <div class="seq-grid-wrap"><div class="drum-grid" id="grid"></div></div>
+  </div>
+
+  <!-- Rhythm track -->
+  <div class="panel">
+    <div class="panel-bar" data-panel="trk"><span class="panel-bar-arrow">&#9654;</span><span class="panel-bar-label">Rhythm Track</span><span class="panel-bar-note" id="trkNote"></span></div>
+    <div class="panel-body" id="body-trk">
+      <div class="panel-inner">
+        <div class="field"><label>Track</label><select id="trkSel"></select></div>
+        <button class="btn" id="btnTrkGet" disabled>&#8595; Read</button>
+        <button class="btn btn-primary" id="btnTrkPut" disabled>&#8593; Write</button>
+        <button class="btn" id="btnTrkAdd">+ Measure</button>
+        <button class="btn" id="btnTrkDel">&minus; Measure</button>
+        <p class="note">A track stores the STEP-button <b>slot</b> for each measure, not the variation
+          &mdash; the BASIC VARIATION switch is applied live at playback, exactly as on the stock
+          machine. 12 tracks, 64 measures each. Click a measure to cycle its pattern.</p>
+      </div>
+      <div class="trk-grid" id="trkGrid"></div>
+    </div>
+  </div>
+
+  <!-- Panel calibration -->
+  <div class="panel">
+    <div class="panel-bar" data-panel="cal"><span class="panel-bar-arrow">&#9654;</span><span class="panel-bar-label">Panel Calibration</span><span class="panel-bar-note" id="calNote"></span></div>
+    <div class="panel-body" id="body-cal">
+      <div class="panel-inner">
+        <p class="note">The rotary switches reach the CPU through a diode encoder, and its truth table
+          had to be read off a 1981 scan &mdash; good enough to boot, not good enough to trust. This
+          records what each position <b>actually</b> reads on your machine and writes the table into
+          the 808. Everything it needs (step keys, CLEAR, transport) is unambiguous, so it works on a
+          device that has never been calibrated.</p>
+        <button class="btn btn-green" id="btnCalStart" disabled>Start</button>
+        <button class="btn" id="btnCalSkip" disabled>Skip position</button>
+        <button class="btn btn-primary" id="btnCalWrite" disabled>&#8593; Write table</button>
+        <button class="btn" id="btnCalRead" disabled>&#8595; Read table</button>
+        <div class="field"><label>Live matrix</label><span class="live-nib" id="calLive">&mdash;</span></div>
+      </div>
+      <div class="cal-list" id="calList"></div>
+    </div>
+  </div>
+
+  <!-- Device settings -->
+  <div class="panel">
+    <div class="panel-bar" data-panel="set"><span class="panel-bar-arrow">&#9654;</span><span class="panel-bar-label">Device Settings</span></div>
+    <div class="panel-body" id="body-set">
+      <div class="panel-inner">
+        <div class="field"><label>MIDI channel</label><select id="setChan" disabled></select></div>
+        <div class="field"><label>Clock sync</label><select id="setClk" disabled>
+          <option value="0">MIDI sync</option><option value="1">Internal / DIN</option></select></div>
+        <div class="field"><label>MIDI out</label><select id="setOut2" disabled>
+          <option value="0">Out</option><option value="1">Thru</option></select></div>
+        <button class="btn" id="btnSetGet" disabled>&#8595; Read</button>
+        <button class="btn btn-primary" id="btnSetPut" disabled>&#8593; Write</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Firmware + program image -->
+  <div class="panel">
+    <div class="panel-bar" data-panel="fw"><span class="panel-bar-arrow">&#9654;</span><span class="panel-bar-label">Firmware &amp; program image</span></div>
+    <div class="panel-body" id="body-fw">
+      <div class="panel-inner">
+        <p class="note">Power the 808 on with <b>STEP 1</b> held to enter the bootloader &mdash; step
+          LEDs 1-4 blink twice, then step 1 stays lit. Do not power off mid-transfer.</p>
+        <button class="btn" id="btnFwLoad">&#8593; Load .syx</button>
+        <input type="file" id="fileFw" accept=".syx">
+        <span id="fwStatus" class="cal-val" style="color:var(--gray-3)">no file loaded</span>
+        <button class="btn btn-green" id="btnFwSend" disabled>Send firmware</button>
+        <div class="bar-outer"><div class="bar-inner" id="fwBar"></div></div>
+      </div>
+      <div class="panel-inner" style="border-top:var(--rule-sm)">
+        <p class="note">The &micro;PD650C-085 program is copyrighted and is <b>not</b> distributed
+          with SuperOS-808. Load your own &mdash; a raw 2048-byte file, or a recpu/RE-303
+          format <b>.syx</b> transfer. Emulator builds only.</p>
+        <button class="btn" id="btnImgLoad">&#8593; Load program image</button>
+        <input type="file" id="fileImg">
+        <span id="imgStatus" class="cal-val" style="color:var(--gray-3)">no file loaded</span>
+        <button class="btn btn-green" id="btnImgSend" disabled>Send to 808</button>
+        <button class="btn" id="btnEmu" disabled>Boot emulator</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="panel">
+    <div class="panel-bar is-open" data-panel="log"><span class="panel-bar-arrow">&#9654;</span><span class="panel-bar-label">Log</span></div>
+    <div class="panel-body is-open" id="body-log"><div id="log"></div></div>
+  </div>
+
+</div>
+
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// Device model — must track src/pattern.h and src/controls.h
+// ---------------------------------------------------------------------------
+const INSTS = ['AC','BD','SD','LT','MT','HT','RS','CP','CB','CY','OH','CH'];
+const INST_NAMES = ['Accent','Bass Drum','Snare Drum','Low Tom / Conga',
+  'Mid Tom / Conga','Hi Tom / Conga','Rim Shot / Claves','Hand Clap / Maracas',
+  'Cowbell','Cymbal','Open Hi-Hat','Closed Hi-Hat'];
+const NI = INSTS.length;                       // 12
+const NSEC = 4, SECLEN = 16, MAXSTEPS = NSEC * SECLEN;
+const NSLOTS = 16, NBASIC = 12, NPAT = 32, NTRK = 12, TRKMAX = 64;
+const RATCHET_SLOTS = 16, PROB_SLOTS = 40;
+const PATTERN_BYTES = NI*NSEC*2 + NSEC + 2 + RATCHET_SLOTS*2 + PROB_SLOTS*2 + NI + 2; // 228
+const TRACK_BYTES = 1 + TRKMAX;                // 65
+const MFR = 0x7D;
+const SPB = [3,6,4,8];                         // steps per beat, by pre-scale
+const PART_NAMES = ['1st Part','2nd Part','3rd (SuperOS)','4th (SuperOS)'];
+
+function emptyPattern(){
+  return {
+    steps: Array.from({length:NI},()=>new Uint16Array(NSEC)),
+    seclen: [16,0,0,0], prescale: 2, swing: 0,
+    rstep: new Uint8Array(RATCHET_SLOTS).fill(0xFF), rval: new Uint8Array(RATCHET_SLOTS),
+    pstep: new Uint8Array(PROB_SLOTS).fill(0xFF),    pval: new Uint8Array(PROB_SLOTS),
+    ilen: new Uint8Array(NI), poly: 0,
+  };
+}
+function serializePattern(p){
+  const b = new Uint8Array(PATTERN_BYTES); let o = 0;
+  for(let i=0;i<NI;i++) for(let s=0;s<NSEC;s++){
+    b[o++] = p.steps[i][s] & 0xFF; b[o++] = (p.steps[i][s] >> 8) & 0xFF;
+  }
+  for(let s=0;s<NSEC;s++) b[o++] = p.seclen[s];
+  b[o++] = p.prescale; b[o++] = p.swing;
+  b.set(p.rstep,o); o += RATCHET_SLOTS;
+  b.set(p.rval, o); o += RATCHET_SLOTS;
+  b.set(p.pstep,o); o += PROB_SLOTS;
+  b.set(p.pval, o); o += PROB_SLOTS;
+  b.set(p.ilen, o); o += NI;
+  b[o++] = p.poly & 0xFF; b[o++] = (p.poly >> 8) & 0xFF;
+  return b;
+}
+function deserializePattern(b){
+  const p = emptyPattern(); let o = 0;
+  for(let i=0;i<NI;i++) for(let s=0;s<NSEC;s++){ p.steps[i][s] = b[o] | (b[o+1]<<8); o+=2; }
+  for(let s=0;s<NSEC;s++) p.seclen[s] = Math.min(16, b[o++]);
+  p.prescale = b[o++] & 3; p.swing = b[o++] & 15;
+  p.rstep = b.slice(o,o+RATCHET_SLOTS); o += RATCHET_SLOTS;
+  p.rval  = b.slice(o,o+RATCHET_SLOTS); o += RATCHET_SLOTS;
+  p.pstep = b.slice(o,o+PROB_SLOTS);    o += PROB_SLOTS;
+  p.pval  = b.slice(o,o+PROB_SLOTS);    o += PROB_SLOTS;
+  p.ilen  = b.slice(o,o+NI);            o += NI;
+  p.poly  = b[o] | (b[o+1]<<8);
+  return p;
+}
+
+// 7-bit packing, the bootloader's scheme: one MSB byte per 7 data bytes.
+function pack7(src){
+  const out = [];
+  for(let i=0;i<src.length;i+=7){
+    const run = Math.min(7, src.length - i);
+    let msb = 0;
+    for(let b=0;b<run;b++) if(src[i+b] & 0x80) msb |= 1<<b;
+    out.push(msb);
+    for(let b=0;b<run;b++) out.push(src[i+b] & 0x7F);
+  }
+  return out;
+}
+function unpack7(src, cap){
+  const out = []; let i = 0;
+  while(i < src.length && out.length < cap){
+    const msb = src[i++];
+    for(let b=0;b<7 && i<src.length && out.length<cap;b++)
+      out.push(src[i++] | (((msb>>b)&1) << 7));
+  }
+  return Uint8Array.from(out);
+}
+const xorSum = a => a.reduce((x,v)=>x^v, 0);
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+let midi = null, portIn = null, portOut = null;
+let curVar = 0, curSlot = 0;
+const patterns = Array.from({length:NPAT}, emptyPattern);
+const tracks = Array.from({length:NTRK}, () => ({len:0, pat:new Uint8Array(TRKMAX)}));
+let playingSlot = -1, playhead = -1;
+// The 808 stops sending 0x15 the moment it stops, so a stale playhead is
+// cleared on a timer rather than trusting a stop message to arrive.
+let lastPlayheadMs = 0, warnedShortProbe = false;
+setInterval(() => {
+  if(playhead >= 0 && performance.now() - lastPlayheadMs > 400){ playhead = -1; applyPlayhead(); renderPills(); }
+}, 200);
+let reqQueue = [];
+
+const patIndex = () => curVar * NSLOTS + curSlot;
+const curPat = () => patterns[patIndex()];
+function patName(idx){
+  const slot = idx % NSLOTS, v = idx < NSLOTS ? 'A' : 'B';
+  return slot < NBASIC ? `Basic Rhythm ${slot+1} ${v}` : `Intro / Fill In ${slot-NBASIC+1} ${v}`;
+}
+
+function log(msg, cls){
+  const el = $('log');
+  const t = new Date().toLocaleTimeString();
+  el.innerHTML += `<span class="${cls||''}">${t}  ${msg}</span>\n`;
+  el.scrollTop = el.scrollHeight;
+}
+function setStatus(msg, cls){
+  const s = $('midiStatus'); s.textContent = msg; s.className = cls || '';
+}
+function setChip(id, text, cls){
+  const e = $(id); e.textContent = text; e.className = 'chip' + (cls ? ' ' + cls : '');
+}
+
+// ---------------------------------------------------------------------------
+// MIDI
+// ---------------------------------------------------------------------------
+async function startMidi(){
+  try{ midi = await navigator.requestMIDIAccess({sysex:true}); }
+  catch(e){ setStatus('SysEx permission denied', 'is-warn'); log('requestMIDIAccess failed: '+e,'log-err'); return; }
+  const fill = (sel, ports) => {
+    const prev = sel.value; sel.innerHTML = '';
+    for(const p of ports.values()){
+      const o = document.createElement('option'); o.value = p.id; o.textContent = p.name; sel.appendChild(o);
+    }
+    if(prev) sel.value = prev;
+    sel.disabled = false;
+  };
+  fill($('selIn'), midi.inputs); fill($('selOut'), midi.outputs);
+  midi.onstatechange = () => { fill($('selIn'), midi.inputs); fill($('selOut'), midi.outputs); };
+  setStatus('pick ports, then Connect');
+}
+
+function connect(){
+  if(!midi){ startMidi(); return; }
+  portIn  = midi.inputs.get($('selIn').value);
+  portOut = midi.outputs.get($('selOut').value);
+  if(!portIn || !portOut){ setStatus('pick both ports', 'is-warn'); return; }
+  for(const p of midi.inputs.values()) p.onmidimessage = null;
+  portIn.onmidimessage = onMidi;
+  warnedShortProbe = false;
+  setStatus('connected — ' + portIn.name, 'is-ok');
+  $('btnMidi').classList.add('is-connected');
+  $('btnMidi').textContent = 'Connected';
+  document.querySelectorAll('button[disabled], select[disabled]').forEach(b => {
+    if(b.id !== 'btnCalSkip' && b.id !== 'btnCalWrite') b.disabled = false;
+  });
+  log('connected  in=' + portIn.name + '  out=' + portOut.name, 'log-note');
+  identify();
+}
+
+// Identify, and notice when nothing answers. The emulator firmware is a
+// listener only — it never transmits — so silence is exactly what "the 808 is in
+// emulator mode" looks like from here. Without this the editor just sat there
+// looking connected and doing nothing, which is indistinguishable from a bug.
+let identifyTimer = null;
+function identify(){
+  $('emuBanner').classList.remove('visible');
+  clearTimeout(identifyTimer);
+  sendCmd(0x60); sendCmd(0x30); sendCmd(0x10, [patIndex()]);
+  identifyTimer = setTimeout(() => {
+    $('emuBanner').classList.add('visible');
+    setStatus('connected, but no reply from the 808', 'is-warn');
+    log('no reply to Identify — emulator mode, wrong MIDI port, or the 808 is not running SuperOS', 'log-err');
+  }, 1200);
+}
+
+const send = bytes => { if(portOut) portOut.send(Uint8Array.from(bytes)); };
+const sendCmd = (cmd, body) => send([0xF0, MFR, cmd, ...(body||[]), 0xF7]);
+
+function onMidi(e){
+  const d = e.data;
+  if(d[0] !== 0xF0 || d[1] !== MFR) return;
+  const cmd = d[2], a = d.slice(3, d.length-1);
+
+  // Anything at all coming back means SuperOS is listening.
+  clearTimeout(identifyTimer);
+  $('emuBanner').classList.remove('visible');
+
+  switch(cmd){
+    case 0x11: {                                   // pattern dump
+      const pat = a[0];
+      const want = (a[1] & 0x7F) | ((a[2] & 1) << 7);
+      const raw = unpack7(a.slice(3), PATTERN_BYTES);
+      if(raw.length !== PATTERN_BYTES || xorSum(raw) !== want){ log('pattern '+pat+' dump bad','log-err'); break; }
+      patterns[pat] = deserializePattern(raw);
+      if(pat === patIndex()) render();
+      renderPills();
+      log('read ' + patName(pat), 'log-ack');
+      pumpQueue();
+      break;
+    }
+    case 0x14: log(a[0] === 0 ? 'ack' : 'REJECTED (code '+a[0]+')', a[0] === 0 ? 'log-ack':'log-err'); break;
+    case 0x15: {                                   // running playhead, per step
+      playingSlot = a[0] % NSLOTS;
+      lastPlayheadMs = performance.now();
+      const step = a.length > 1 ? a[1] : 0;
+      // Only draw it when the pattern on screen is the one playing.
+      playhead = (a[0] === patIndex()) ? step : -1;
+      applyPlayhead();
+      if(step === 0) renderPills();               // pills only need the measure
+      break;
+    }
+    case 0x16: {                                   // panel step edit
+      const [pat, inst, step, on] = a;
+      const sec = step >> 4, bit = step & 15;
+      if(on) patterns[pat].steps[inst][sec] |= (1<<bit);
+      else   patterns[pat].steps[inst][sec] &= ~(1<<bit);
+      if(pat === patIndex()) renderGrid();
+      break;
+    }
+    case 0x18: {                                   // layout update
+      const pat = a[0];
+      patterns[pat].seclen = [a[1],a[2],a[3],a[4]];
+      patterns[pat].prescale = a[5];
+      if(pat === patIndex()) render();
+      break;
+    }
+    case 0x1E:                                     // selected pattern (stopped)
+      curSlot = a[0] % NSLOTS; curVar = Math.floor(a[0] / NSLOTS);
+      playhead = -1;                               // stopped: no playhead
+      renderTabs(); render();
+      break;
+    case 0x25: {                                   // track dump
+      const trk = a[0];
+      const want = (a[1] & 0x7F) | ((a[2] & 1) << 7);
+      const raw = unpack7(a.slice(3), TRACK_BYTES);
+      if(raw.length !== TRACK_BYTES || xorSum(raw) !== want){ log('track dump bad','log-err'); break; }
+      tracks[trk] = { len: raw[0], pat: raw.slice(1) };
+      if(trk === Number($('trkSel').value)) renderTrack();
+      log('read track ' + (trk+1) + ' (' + tracks[trk].len + ' measures)', 'log-ack');
+      pumpQueue();
+      break;
+    }
+    case 0x31:                                     // settings
+      $('setChan').value = String(a[0]); $('setClk').value = String(a[1]); $('setOut2').value = String(a[2]);
+      log(`settings  chan=${a[0]||'omni'}  clk=${a[1]?'internal':'midi'}  out=${a[2]?'thru':'out'}`, 'log-ack');
+      break;
+    case 0x3C: onProbe(a); break;                  // raw panel matrix
+    case 0x53: {                                   // panel table dump
+      const raw = unpack7(a.slice(2), 64);
+      renderMapDump(raw);
+      break;
+    }
+    case 0x61: {                                   // device info
+      const flags = a[2];
+      setChip('chipFw', 'firmware v'+a[0]+'.'+a[1], 'is-on');
+      setChip('chipStore', 'internal flash', 'is-on');   // this build has no other backend
+      setChip('chipEmu', flags & 1 ? 'emulator built in' : 'no emulator', flags & 1 ? 'is-on' : '');
+      const cal = !!(flags & 4);
+      setChip('chipCal', cal ? 'panel calibrated' : 'panel DEFAULTS', cal ? 'is-on' : 'is-warn');
+      $('calBanner').classList.toggle('visible', !cal);
+      $('calNote').textContent = cal ? 'calibrated' : 'not calibrated';
+      $('btnEmu').disabled = !(flags & 1);
+      $('btnEmuTop').disabled = !(flags & 1);
+      log('device identified', 'log-note');
+      break;
+    }
+  }
+}
+
+// Read-everything queue: one request at a time so a dump never overruns the
+// device's TX queue.
+function reqAll(){
+  reqQueue = [];
+  for(let p=0;p<NPAT;p++) reqQueue.push(['pat',p]);
+  for(let t=0;t<NTRK;t++) reqQueue.push(['trk',t]);
+  log('reading all 32 patterns + 12 tracks', 'log-note');
+  pumpQueue();
+}
+function pumpQueue(){
+  if(!reqQueue.length) return;
+  const [kind, i] = reqQueue.shift();
+  sendCmd(kind === 'pat' ? 0x10 : 0x24, [i]);
+}
+
+// ---------------------------------------------------------------------------
+// Render — pills, parts, grid
+// ---------------------------------------------------------------------------
+function renderTabs(){
+  document.querySelectorAll('#varTabs .group-tab').forEach(t =>
+    t.classList.toggle('is-active', Number(t.dataset.var) === curVar));
+}
+
+function renderPills(){
+  const box = $('patPills'); box.innerHTML = '';
+  for(let s=0;s<NSLOTS;s++){
+    const d = document.createElement('div');
+    const p = patterns[curVar*NSLOTS + s];
+    const empty = p.steps.every(r => r.every(v => v === 0));
+    d.className = 'pat-pill'
+      + (s === curSlot ? ' is-active' : '')
+      + (s >= NBASIC ? ' is-fill' : '')
+      + (empty ? ' is-empty' : ' is-full')
+      + (s === playingSlot ? ' is-playing' : '');
+    d.textContent = s < NBASIC ? String(s+1) : 'I' + (s-NBASIC+1);
+    d.title = (s < NBASIC ? 'Basic Rhythm ' + (s+1) : 'Intro / Fill In ' + (s-NBASIC+1))
+            + ' ' + (curVar ? 'B' : 'A') + (empty ? ' — empty' : '');
+    d.onclick = () => { curSlot = s; sendCmd(0x10,[patIndex()]); render(); };
+    box.appendChild(d);
+  }
+}
+
+function renderParts(){
+  const box = $('partStrip'); box.innerHTML = '';
+  const p = curPat();
+  for(let s=0;s<NSEC;s++){
+    const c = document.createElement('div');
+    c.className = 'part-cell' + (s > 1 ? ' is-super' : '');
+    const n = document.createElement('span');
+    n.className = 'part-name'; n.textContent = PART_NAMES[s];
+    c.appendChild(n);
+    const mk = (txt, delta) => {
+      const b = document.createElement('button');
+      b.className = 'len-adj-btn'; b.textContent = txt;
+      b.onclick = () => {
+        p.seclen[s] = Math.max(0, Math.min(16, p.seclen[s] + delta));
+        render();
+      };
+      return b;
+    };
+    c.appendChild(mk('−', -1));
+    const num = document.createElement('div');
+    num.className = 'len-num' + (p.seclen[s] === 0 ? ' is-zero' : '');
+    num.textContent = p.seclen[s] === 0 ? '0' : String(p.seclen[s]);
+    c.appendChild(num);
+    c.appendChild(mk('+', +1));
+    box.appendChild(c);
+  }
+  const tot = p.seclen.reduce((a,b)=>a+b,0);
+  const spb = SPB[p.prescale];
+  const c = document.createElement('div');
+  c.className = 'part-cell';
+  c.innerHTML = `<span class="part-name">Measure</span>` +
+    `<span class="cal-val">${tot} steps &middot; ${(tot/spb).toFixed(2)} beats</span>`;
+  box.appendChild(c);
+}
+
+function renderGrid(){
+  const g = $('grid'); g.innerHTML = '';
+  const p = curPat();
+  const spb = SPB[p.prescale];
+  // Show every section that has steps, plus the 1st part always; at minimum 16.
+  let cols = 0;
+  for(let s=0;s<NSEC;s++) if(p.seclen[s] > 0) cols = (s+1) * SECLEN;
+  if(cols < SECLEN) cols = SECLEN;
+  g.style.gridTemplateColumns =
+    `minmax(140px,170px) repeat(${cols}, minmax(25px,1fr))`;
+
+  // header row
+  const corner = document.createElement('div');
+  corner.className = 'dg-corner'; corner.textContent = 'Instrument';
+  g.appendChild(corner);
+  for(let c=0;c<cols;c++){
+    const sec = c >> 4, k = c & 15;
+    const h = document.createElement('div');
+    const live = k < p.seclen[sec];
+    h.className = 'dg-hdr' + (k === 0 ? ' is-partstart' : (live && k % spb === 0 ? ' is-beat' : ''))
+                + (live ? '' : ' is-beyond');
+    h.dataset.col = c;
+    h.textContent = k === 0 ? ['1st','2nd','3rd','4th'][sec] : String(k+1);
+    g.appendChild(h);
+  }
+
+  for(let i=0;i<NI;i++){
+    const lbl = document.createElement('div');
+    lbl.className = 'dg-rowlbl' + (i === 0 ? ' dg-row-ac' : '');
+    lbl.innerHTML = `<span class="dg-abbr">${INSTS[i]}</span>` +
+                    `<span class="dg-name">${INST_NAMES[i]}</span>`;
+    const tools = document.createElement('div');
+    tools.className = 'dg-rowtools';
+    const mkTool = (t, title, fn) => {
+      const b = document.createElement('button');
+      b.className = 'dg-tool'; b.textContent = t; b.title = title; b.onclick = fn;
+      return b;
+    };
+    tools.appendChild(mkTool('\u00D7','clear this row', () => {
+      for(let s=0;s<NSEC;s++) p.steps[i][s] = 0; renderGrid(); renderPills();
+    }));
+    tools.appendChild(mkTool('\u2039','shift left', () => { shiftRow(i,-1); }));
+    tools.appendChild(mkTool('\u203A','shift right',() => { shiftRow(i,+1); }));
+    lbl.appendChild(tools);
+    g.appendChild(lbl);
+
+    for(let c=0;c<cols;c++){
+      const sec = c >> 4, k = c & 15;
+      const live = k < p.seclen[sec];
+      const on = (p.steps[i][sec] >> k) & 1;
+      const d = document.createElement('div');
+      d.className = 'dg-cell'
+        + (i === 0 ? ' dg-row-ac' : '')
+        + (on ? ' is-on' : '')
+        + (live ? (k % spb === 0 && k ? ' is-beat' : '') : ' is-beyond');
+      d.dataset.col = c;
+      if(live){
+        d.onclick = () => {
+          p.steps[i][sec] ^= (1<<k);
+          // Live edit: push this one step to the 808 immediately (0x13). The
+          // panel does the same in the other direction with 0x16, so an edit
+          // made on either side shows up on the other without a manual send.
+          sendCmd(0x13, [patIndex(), i, sec * 16 + k, (p.steps[i][sec] >> k) & 1]);
+          renderGrid(); renderPills();
+        };
+      }
+      g.appendChild(d);
+    }
+  }
+  applyPlayhead();
+}
+
+// Move the playhead marker without rebuilding the grid — this runs at every
+// step while the 808 is playing (up to ~20 Hz), so it only touches classes.
+function applyPlayhead(){
+  const g = $('grid');
+  g.querySelectorAll('.is-playing-col').forEach(e => e.classList.remove('is-playing-col'));
+  if(playhead < 0) return;
+  g.querySelectorAll(`[data-col="${playhead}"]`).forEach(e => e.classList.add('is-playing-col'));
+}
+
+// Rotate one instrument row across the whole measure (the parts it actually uses).
+function shiftRow(i, dir){
+  const p = curPat();
+  const len = p.seclen.reduce((a,b)=>a+b,0) || 1;
+  const flat = [];
+  for(let q=0;q<len;q++){
+    let r = q;
+    for(let s=0;s<NSEC;s++){
+      if(r < p.seclen[s]) { flat.push((p.steps[i][s] >> r) & 1); break; }
+      r -= p.seclen[s];
+    }
+  }
+  const out = flat.map((_,q) => flat[(q - dir + len*2) % len]);
+  for(let s=0;s<NSEC;s++) p.steps[i][s] = 0;
+  let q = 0;
+  for(let s=0;s<NSEC;s++) for(let r=0;r<p.seclen[s];r++,q++)
+    if(out[q]) p.steps[i][s] |= (1<<r);
+  renderGrid();
+}
+
+function render(){
+  $('preSel').value = String(curPat().prescale);
+  $('patTitle').textContent = patName(patIndex());
+  const p = curPat();
+  const tot = p.seclen.reduce((a,b)=>a+b,0);
+  $('seqHint').innerHTML = curSlot >= NBASIC
+    ? 'This is an <b>INTRO / FILL IN</b> slot &mdash; TAP inserts it, AUTO FILL IN schedules it.'
+    : `Step count is per part; <b>A and B share the layout</b>, so changing it here changes both. ${tot} of 64 steps used.`;
+  renderTabs(); renderPills(); renderParts(); renderGrid();
+}
+
+// ---------------------------------------------------------------------------
+// Rhythm track
+// ---------------------------------------------------------------------------
+function renderTrack(){
+  const t = tracks[Number($('trkSel').value)];
+  $('trkNote').textContent = t.len + ' / ' + TRKMAX + ' measures';
+  const box = $('trkGrid'); box.innerHTML = '';
+  for(let i=0;i<t.len;i++){
+    const slot = t.pat[i];
+    const d = document.createElement('div');
+    d.className = 'trk-cell' + (slot >= NBASIC ? ' is-fill' : '');
+    d.innerHTML = `<span class="trk-num">${i+1}</span>` +
+                  (slot < NBASIC ? String(slot+1) : 'I'+(slot-NBASIC+1));
+    d.title = 'measure ' + (i+1) + ' — click to advance, shift-click to go back';
+    d.onclick = ev => {
+      t.pat[i] = (slot + (ev.shiftKey ? NSLOTS-1 : 1)) % NSLOTS;
+      renderTrack();
+    };
+    box.appendChild(d);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Panel calibration
+// ---------------------------------------------------------------------------
+// The PanelMap layout below must track src/controls.h exactly; the firmware
+// static_asserts sizeof(PanelMap) == 43 for the same reason.
+const MAP_LAYOUT = [
+  ['magic',1],
+  ['mode_code',6], ['mode_mask',1], ['clear_bit',1],
+  ['pre_code',4],  ['pre_mask',1],
+  ['var_code',3],  ['var_mask',1],
+  ['inst_code',12],['inst_mask',1],
+  ['fill_code',6], ['fill_mask',1], ['ifvar_bit',1],
+  ['run_bit',1], ['tap_bit',1], ['fillin_bit',1], ['clock_bit',1],
+];
+const MAP_OFF = {}; { let o=0; for(const [k,n] of MAP_LAYOUT){ MAP_OFF[k]=o; o+=n; } }
+const MAP_BYTES = MAP_OFF.clock_bit + 1;       // 43
+
+const MODE_NAMES = ['PATTERN CLEAR','1st PART','2nd PART','MANUAL PLAY','PLAY','COMPOSE'];
+const FILL_NAMES = ['MANUAL','16','12','8','4','2'];
+
+function buildScript(){
+  const s = [];
+  for(let i=0;i<6;i++)  s.push({cell:0, field:'mode_code', idx:i, text:`Turn MODE to <b>${MODE_NAMES[i]}</b>`});
+  for(let i=0;i<4;i++)  s.push({cell:1, field:'pre_code',  idx:i, text:`Turn PRE SCALE to <b>${i+1}</b>`});
+  [['A',0],['AB',1],['B',2]].forEach(([n,i]) =>
+                        s.push({cell:1, field:'var_code',  idx:i, text:`Turn BASIC VARIATION to <b>${n}</b>`}));
+  for(let i=0;i<12;i++) s.push({cell:2, field:'inst_code', idx:i, text:`Turn INSTRUMENT / TRACK to <b>${INSTS[i]}</b>`});
+  for(let i=0;i<6;i++)  s.push({cell:3, field:'fill_code', idx:i, text:`Turn AUTO FILL IN to <b>${FILL_NAMES[i]}</b>`});
+  s.push({cell:0, field:'clear_bit', bit:true, text:'Hold the red <b>CLEAR</b> button'});
+  s.push({cell:3, field:'ifvar_bit', bit:true, text:'Set I/F VARIATION to <b>B</b>'});
+  s.push({status:true, field:'run_bit',    text:'Press <b>START/STOP</b> so it is RUNNING'});
+  s.push({status:true, field:'tap_bit',    text:'Hold the <b>TAP</b> button'});
+  s.push({status:true, field:'fillin_bit', text:'Hold the rear <b>FILL IN</b> pedal (skip if you have none)'});
+  s.push({status:true, field:'clock_bit',  text:'Leave everything alone &mdash; capturing the TEMPO CLOCK line'});
+  return s;
+}
+
+let calScript = [], calPos = -1, calMap = null, calBase = null, calLast = null, calStable = 0;
+const nib = v => (v & 0x0F).toString(2).padStart(4,'0');
+const lowestBit = v => { for(let i=0;i<8;i++) if(v & (1<<i)) return i; return 0; };
+
+function calRender(){
+  const box = $('calList'); box.innerHTML = '';
+  calScript.forEach((st,i) => {
+    const d = document.createElement('div');
+    d.className = 'cal-step' + (i === calPos ? ' is-on' : (i < calPos ? ' is-done' : ''));
+    d.innerHTML = `<span class="cal-idx">${String(i+1).padStart(2,'0')}</span>` +
+                  `<span class="cal-txt">${st.text}</span>` +
+                  `<span class="cal-val">${st.captured !== undefined ? (st.bitLike ? 'bit '+st.captured : nib(st.captured)) : ''}</span>`;
+    box.appendChild(d);
+  });
+  $('calNote').textContent = calPos < 0 ? '' :
+    (calPos >= calScript.length ? 'captured — write it' : `step ${calPos+1} of ${calScript.length}`);
+  $('btnCalWrite').disabled = !(calMap && calPos >= calScript.length);
+  $('btnCalSkip').disabled = !(calPos >= 0 && calPos < calScript.length);
+}
+
+function calAdvance(captured){
+  if(calPos >= 0 && calPos < calScript.length && captured !== null && captured !== undefined){
+    const st = calScript[calPos];
+    st.captured = captured;
+    st.bitLike = !!(st.bit || st.status);
+    calMap[MAP_OFF[st.field] + (st.idx || 0)] = captured;
+  }
+  calPos++; calBase = null; calLast = null; calStable = 0;
+  if(calPos >= calScript.length){
+    log('calibration walk complete — review, then write the table', 'log-note');
+    setStatus('calibration captured', 'is-ok');
+  }
+  calRender();
+}
+
+// A probe arrived. For a rotary we take the whole PA nibble of the named cell.
+// For a single bit (a button, a two-position switch, a status line) we diff
+// against the resting state captured when the step opened, so we learn WHICH bit
+// moved instead of assuming one.
+function onProbe(a){
+  // 0x3C payload, ONE NIBBLE PER BYTE: [0..3] PA per scan column (rotaries and
+  // buttons), [4..7] PB per scan column (step keys), [8] status, [9] the SW1b
+  // mode probe (PI0 driven high, PC bus read back — a second, independent view
+  // of the MODE knob, and what breaks the COMPOSE/PLAY tie in the SW1a diode
+  // encoder; reads a constant on an unmodded board).
+  if(a.length < 10){
+    // Logged once per connection: the firmware streams these continuously in
+    // calibration mode, and a thousand identical lines buries everything else.
+    if(!warnedShortProbe){
+      warnedShortProbe = true;
+      log('short 0x3C probe — this firmware predates the nibble-per-byte probe fix '
+          + 'and cannot report PA3 (CLEAR, BASIC VARIATION AB, I/F VARIATION B, '
+          + 'INSTRUMENT >= 8). Reflash before calibrating. (further copies muted)', 'log-err');
+    }
+    return;
+  }
+  const cells = [a[0],a[1],a[2],a[3]];        // PA nibbles — what calibration reads
+  const steps = [a[4],a[5],a[6],a[7]];        // PB nibbles — step keys
+  const status = a[8], sw1b = a[9];
+  $('calLive').textContent =
+    `${nib(cells[0])} ${nib(cells[1])} ${nib(cells[2])} ${nib(cells[3])} | ${nib(status)}`
+    + `  PB ${nib(steps[0])} ${nib(steps[1])} ${nib(steps[2])} ${nib(steps[3])}`
+    + `  SW1b ${nib(sw1b)}`;
+  if(calPos < 0 || calPos >= calScript.length) return;
+  const st = calScript[calPos];
+
+  if(st.status){
+    if(calBase === null){ calBase = status; return; }
+    const diff = status ^ calBase;
+    if(diff) calAdvance(lowestBit(diff));
+    return;
+  }
+  // cells[] is the PA nibble already. Under the old packed-cell payload this
+  // same expression picked the LOW nibble, i.e. the step keys, so no rotary step
+  // could ever advance.
+  const v = cells[st.cell] & 0x0F;
+  if(st.bit){
+    if(calBase === null){ calBase = v; return; }
+    const diff = v ^ calBase;
+    if(diff) calAdvance(lowestBit(diff));
+    return;
+  }
+  if(calLast === v){ if(++calStable >= 3) calAdvance(v); }
+  else { calLast = v; calStable = 0; }
+}
+
+function calStart(){
+  calScript = buildScript();
+  calMap = new Uint8Array(MAP_BYTES);
+  // Seed the firmware defaults so a skipped position keeps a sane value.
+  calMap[MAP_OFF.magic]     = 0x88;
+  calMap[MAP_OFF.mode_mask] = 0x07;
+  calMap[MAP_OFF.pre_mask]  = 0x03;
+  calMap[MAP_OFF.var_mask]  = 0x0C;
+  calMap[MAP_OFF.inst_mask] = 0x0F;
+  calMap[MAP_OFF.fill_mask] = 0x07;
+  calPos = 0; calBase = null; calLast = null; calStable = 0;
+  calRender();
+  sendCmd(0x51);        // firmware streams 0x3C on every matrix change
+  log('calibration started — follow the highlighted step', 'log-note');
+}
+
+function calWrite(){
+  if(!calMap) return;
+  const x = xorSum(calMap);
+  sendCmd(0x50, [x & 0x7F, (x>>7)&1, ...pack7(calMap)]);
+  log('panel table written', 'log-note');
+  setTimeout(() => sendCmd(0x60), 200);   // refresh the calibrated chip
+}
+
+function renderMapDump(raw){
+  const L = [];
+  L.push('MODE   ' + MODE_NAMES.map((n,i)=>n+'='+nib(raw[MAP_OFF.mode_code+i])).join('  '));
+  L.push('PRE    ' + [1,2,3,4].map((n,i)=>n+'='+nib(raw[MAP_OFF.pre_code+i])).join('  '));
+  L.push('VAR    ' + ['A','AB','B'].map((n,i)=>n+'='+nib(raw[MAP_OFF.var_code+i])).join('  '));
+  L.push('INST   ' + INSTS.map((n,i)=>n+'='+nib(raw[MAP_OFF.inst_code+i])).join(' '));
+  L.push('FILL   ' + FILL_NAMES.map((n,i)=>n+'='+nib(raw[MAP_OFF.fill_code+i])).join('  '));
+  L.push('BITS   clear=' + raw[MAP_OFF.clear_bit] + ' ifvar=' + raw[MAP_OFF.ifvar_bit] +
+         ' run=' + raw[MAP_OFF.run_bit] + ' tap=' + raw[MAP_OFF.tap_bit] +
+         ' fill=' + raw[MAP_OFF.fillin_bit] + ' clock=' + raw[MAP_OFF.clock_bit]);
+  log('panel table:\n' + L.join('\n'));
+}
+
+// ---------------------------------------------------------------------------
+// Firmware / program-image upload
+// ---------------------------------------------------------------------------
+// A .syx firmware file is already a stream of complete SysEx messages for the
+// bootloader. Split on F0..F7 and pace them: the bootloader erases and writes a
+// flash page per message and cannot buffer ahead.
+function splitSysex(bytes){
+  const out = []; let i = 0;
+  while(i < bytes.length){
+    if(bytes[i] !== 0xF0){ i++; continue; }
+    const end = bytes.indexOf(0xF7, i);
+    if(end < 0) break;
+    out.push(bytes.slice(i, end+1));
+    i = end + 1;
+  }
+  return out;
+}
+async function sendMsgs(msgs, gapMs, label){
+  log(`${label}: ${msgs.length} messages`, 'log-note');
+  for(let i=0;i<msgs.length;i++){
+    portOut.send(msgs[i]);
+    $('fwBar').style.width = Math.round((i+1)*100/msgs.length) + '%';
+    await new Promise(r => setTimeout(r, gapMs));
+  }
+  log(label + ' complete', 'log-note');
+}
+
+// Wrap a raw 2048-byte dump into the recpu nibble format the firmware expects.
+// The 808's own dump chunks 507 bytes per block, so match that.
+function imgToSysex(bin){
+  const msgs = []; const CHUNK = 507; let blk = 0;
+  for(let off=0; off<bin.length; off+=CHUNK){
+    const part = bin.slice(off, Math.min(off+CHUNK, bin.length));
+    let sum = 0; for(const b of part) sum = (sum + b) & 0xFF;
+    const nibbles = [];
+    for(const b of part){ nibbles.push(b>>4, b&15); }
+    nibbles.push(sum>>4, sum&15);
+    msgs.push(Uint8Array.from([0xF0,0x7D,0x03,0x03,0x7E,0x03,blk++,...nibbles,0xF7]));
+  }
+  msgs.push(Uint8Array.from([0xF0,0x7D,0x03,0x03,0x7F,0x00,0xF7]));
+  return msgs;
+}
+
+// ---------------------------------------------------------------------------
+// JSON save / load
+// ---------------------------------------------------------------------------
+function saveJson(){
+  const doc = {
+    device: 'SuperOS-808', version: 1,
+    patterns: patterns.map(p => ({
+      steps: p.steps.map(r => Array.from(r)),
+      seclen: p.seclen, prescale: p.prescale, swing: p.swing,
+      ilen: Array.from(p.ilen), poly: p.poly,
+      rstep: Array.from(p.rstep), rval: Array.from(p.rval),
+      pstep: Array.from(p.pstep), pval: Array.from(p.pval),
+    })),
+    tracks: tracks.map(t => ({len: t.len, pat: Array.from(t.pat)})),
+  };
+  const blob = new Blob([JSON.stringify(doc)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'superos-808-patterns.json';
+  a.click();
+  log('saved JSON', 'log-note');
+}
+function loadJson(txt){
+  const doc = JSON.parse(txt);
+  if(doc.device !== 'SuperOS-808') { log('not a SuperOS-808 file', 'log-err'); return; }
+  doc.patterns.forEach((s,i) => {
+    if(i >= NPAT) return;
+    const p = emptyPattern();
+    s.steps.forEach((r,k) => p.steps[k] = Uint16Array.from(r));
+    p.seclen = s.seclen; p.prescale = s.prescale; p.swing = s.swing;
+    p.ilen = Uint8Array.from(s.ilen); p.poly = s.poly;
+    p.rstep = Uint8Array.from(s.rstep); p.rval = Uint8Array.from(s.rval);
+    p.pstep = Uint8Array.from(s.pstep); p.pval = Uint8Array.from(s.pval);
+    patterns[i] = p;
+  });
+  (doc.tracks||[]).forEach((t,i) => { if(i<NTRK) tracks[i] = {len:t.len, pat:Uint8Array.from(t.pat)}; });
+  render(); renderTrack();
+  log('loaded JSON', 'log-note');
+}
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+document.querySelectorAll('.panel-bar').forEach(bar => {
+  bar.onclick = () => {
+    const body = $('body-' + bar.dataset.panel);
+    bar.classList.toggle('is-open');
+    body.classList.toggle('is-open');
+  };
+});
+document.querySelectorAll('#varTabs .group-tab').forEach(t => {
+  t.onclick = () => { curVar = Number(t.dataset.var); sendCmd(0x10,[patIndex()]); render(); };
+});
+
+$('btnMidi').onclick = connect;
+$('selIn').onchange = () => { if(portIn) connect(); };
+$('selOut').onchange = () => { if(portOut) connect(); };
+
+$('btnReq').onclick    = () => sendCmd(0x10, [patIndex()]);
+$('btnReqAll').onclick = reqAll;
+$('btnSendPat').onclick = () => {
+  const raw = serializePattern(curPat());
+  const x = xorSum(raw);
+  sendCmd(0x12, [patIndex(), x & 0x7F, (x>>7)&1, ...pack7(raw)]);
+  log('wrote ' + patName(patIndex()), 'log-note');
+};
+$('btnSendAll').onclick = async () => {
+  for(let i=0;i<NPAT;i++){
+    const raw = serializePattern(patterns[i]);
+    const x = xorSum(raw);
+    sendCmd(0x12, [i, x & 0x7F, (x>>7)&1, ...pack7(raw)]);
+    await new Promise(r => setTimeout(r, 60));
+  }
+  for(let t=0;t<NTRK;t++){
+    const raw = new Uint8Array(TRACK_BYTES);
+    raw[0] = tracks[t].len; raw.set(tracks[t].pat.slice(0,TRKMAX), 1);
+    const x = xorSum(raw);
+    sendCmd(0x26, [t, x & 0x7F, (x>>7)&1, ...pack7(raw)]);
+    await new Promise(r => setTimeout(r, 40));
+  }
+  log('wrote all patterns + tracks', 'log-note');
+};
+$('preSel').onchange = () => { curPat().prescale = Number($('preSel').value); render(); };
+
+$('btnTrkGet').onclick = () => sendCmd(0x24, [Number($('trkSel').value)]);
+$('btnTrkPut').onclick = () => {
+  const t = tracks[Number($('trkSel').value)];
+  const raw = new Uint8Array(TRACK_BYTES);
+  raw[0] = t.len; raw.set(t.pat.slice(0,TRKMAX), 1);
+  const x = xorSum(raw);
+  sendCmd(0x26, [Number($('trkSel').value), x & 0x7F, (x>>7)&1, ...pack7(raw)]);
+};
+$('trkSel').onchange = renderTrack;
+$('btnTrkAdd').onclick = () => { const t = tracks[Number($('trkSel').value)]; if(t.len < TRKMAX){ t.pat[t.len++] = 0; renderTrack(); } };
+$('btnTrkDel').onclick = () => { const t = tracks[Number($('trkSel').value)]; if(t.len > 0){ t.len--; renderTrack(); } };
+
+$('btnCalStart').onclick = calStart;
+$('btnCalSkip').onclick  = () => calAdvance(null);
+$('btnCalWrite').onclick = calWrite;
+$('btnCalRead').onclick  = () => sendCmd(0x33);
+
+$('btnSetGet').onclick = () => sendCmd(0x30);
+$('btnSetPut').onclick = () => sendCmd(0x32, [Number($('setChan').value),
+                                              Number($('setClk').value),
+                                              Number($('setOut2').value)]);
+
+$('btnSaveJson').onclick = saveJson;
+$('btnLoadJson').onclick = () => $('fileJson').click();
+$('fileJson').onchange = async e => {
+  const f = e.target.files[0]; if(!f) return;
+  try { loadJson(await f.text()); } catch(err){ log('JSON load failed: '+err, 'log-err'); }
+};
+
+let fwMsgs = null, imgBytes = null, imgIsSyx = false;
+$('btnFwLoad').onclick = () => $('fileFw').click();
+$('fileFw').onchange = async e => {
+  const f = e.target.files[0]; if(!f) return;
+  const b = new Uint8Array(await f.arrayBuffer());
+  fwMsgs = splitSysex(b);
+  $('fwStatus').textContent = `${f.name} — ${fwMsgs.length} pages`;
+  $('fwStatus').style.color = 'var(--black)';
+  $('btnFwSend').disabled = !portOut;
+};
+$('btnFwSend').onclick = async () => {
+  if(!fwMsgs || !portOut) return;
+  $('btnFwSend').disabled = true;
+  // ~18 ms per page: an AT90USB1286 page erase + write is a few ms and the
+  // bootloader is a blocking receiver with no flow control, so pace generously.
+  await sendMsgs(fwMsgs, 18, 'firmware update');
+  $('btnFwSend').disabled = false;
+};
+
+$('btnImgLoad').onclick = () => $('fileImg').click();
+$('fileImg').onchange = async e => {
+  const f = e.target.files[0]; if(!f) return;
+  imgBytes = new Uint8Array(await f.arrayBuffer());
+  imgIsSyx = f.name.toLowerCase().endsWith('.syx') || imgBytes[0] === 0xF0;
+  $('imgStatus').textContent = `${f.name} — ${imgBytes.length} bytes` + (imgIsSyx ? ' (SysEx)' : ' (raw)');
+  $('imgStatus').style.color = 'var(--black)';
+  $('btnImgSend').disabled = !portOut;
+};
+$('btnImgSend').onclick = async () => {
+  if(!imgBytes || !portOut) return;
+  $('btnImgSend').disabled = true;
+  await sendMsgs(imgIsSyx ? splitSysex(imgBytes) : imgToSysex(imgBytes), 30, 'image upload');
+  $('btnImgSend').disabled = false;
+};
+const bootEmulator = () => {
+  sendCmd(0x4D, [1]);
+  log('switching to the emulator — the editor goes quiet, that is expected', 'log-note');
+  // The emulator never transmits, so the identify below is what raises the
+  // "not answering" banner with its Switch to SuperOS button. Without it the
+  // editor just looks broken.
+  setTimeout(identify, 2500);
+};
+$('btnEmu').onclick = bootEmulator;
+$('btnEmuTop').onclick = bootEmulator;
+$('btnToSuperOS').onclick = () => {
+  sendCmd(0x4D, [0]);
+  log('asked the 808 to reboot into SuperOS', 'log-note');
+  // The switch waits for every key to read released, then watchdog-resets, so
+  // give it a moment before asking again.
+  setTimeout(identify, 2500);
+};
+$('btnIdentify').onclick = identify;
+
+// ---------------------------------------------------------------------------
+function init(){
+  const ts = $('trkSel');
+  for(let i=0;i<NTRK;i++){ const o = document.createElement('option'); o.value = String(i); o.textContent = 'Track '+(i+1); ts.appendChild(o); }
+  const cs = $('setChan');
+  const omni = document.createElement('option'); omni.value = '0'; omni.textContent = 'Omni'; cs.appendChild(omni);
+  for(let i=1;i<=16;i++){ const o = document.createElement('option'); o.value = String(i); o.textContent = String(i); cs.appendChild(o); }
+
+  if(location.protocol === 'file:') $('httpBanner').classList.add('visible');
+  render(); renderTrack(); calRender();
+
+  if(navigator.requestMIDIAccess) startMidi();
+  else { setStatus('no Web MIDI — use Chrome or Edge', 'is-warn'); }
+}
+init();
+</script>
+</body>
+</html>
