@@ -194,6 +194,11 @@ class Engine {
 
   // ---- SuperOS performance state (runtime; not persisted) ----
   uint8_t  play_dir   = DIR_FWD;
+  // LENGTH tool: 0 = every pattern plays its own section layout, 1..64 = force
+  // this many steps on ALL patterns, which is what lets a chain of differently
+  // written patterns run to one bar. Runtime only and never persisted, exactly
+  // as on the 606 — it is a performance override, not part of a pattern.
+  uint8_t  global_len = 0;
   uint16_t mute_mask  = 0;      // bit per Instrument, 1 = muted (bit0 = accent)
   bool     reslice_on  = false;
   uint8_t  reslice_len = 0;
@@ -719,7 +724,31 @@ class Engine {
     mark_trk_dirty(cur_track);
   }
 
-  uint8_t eff_len_() { return cur().total_len(); }
+  uint8_t eff_len_() {
+    if (global_len) return global_len > MAX_STEPS ? MAX_STEPS : global_len;
+    return cur().total_len();
+  }
+
+  // Playback position -> absolute step index.
+  //
+  // Normally the measure is the pattern's sections concatenated, so this walks
+  // the section lengths (OM Fig. 8). While the GLOBAL LENGTH override is on it
+  // does not: the override says every pattern is N steps, and a single number
+  // cannot describe a part split, so the measure becomes a flat run of N steps
+  // from step 0 and the part layout is bypassed for as long as it is set.
+  //
+  // For the ordinary case those are the same thing — a stock pattern's 1st PART
+  // is 16 steps and the sections sit on 16-step boundaries, so position n is
+  // step n either way. They only diverge when a 1st PART is SHORTER than 16,
+  // where the layout skips the unused tail of the section and the override
+  // plays straight through it. That is the override doing its job rather than a
+  // rounding error: it is the 606's flat-pattern model, which is what makes the
+  // step data past a short part reachable without editing the part lengths.
+  // Clearing the override restores the machine's own layout untouched.
+  uint8_t pos_to_abs_(uint8_t pos) {
+    if (!global_len) return cur().pos_to_step(pos);
+    return pos >= MAX_STEPS ? (uint8_t)(MAX_STEPS - 1) : pos;
+  }
 
   // Ticks the current step lasts. SWING lengthens on-beat (even pos_) steps and
   // shortens off-beat ones by the same amount, pushing the off-beat later while
@@ -805,7 +834,7 @@ class Engine {
       q = (uint8_t)((reslice_start_ + reslice_off_) % len);
     }
 
-    const uint8_t s = cur().pos_to_step(q);
+    const uint8_t s = pos_to_abs_(q);
     step = (int8_t)s;
     fire_step(s);
     step_advanced = true;

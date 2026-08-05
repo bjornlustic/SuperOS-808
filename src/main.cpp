@@ -555,26 +555,27 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
   switch (tool) {
     case TOOL_LENGTH:
       // Bare step = this section's step count, the stock STEP NUMBER value.
-      // TAP + step = the SELECTED VOICE's own loop length (absolute, so it can
-      // run past the section), and a bare TAP with no step chorded puts that
-      // voice back to following the pattern. That is the 606's Length tool,
-      // where the same two live on TAP+step and TAP+CLEAR; CLEAR is the gateway
-      // key here, so the release of TAP carries the second one.
+      //
+      // TAP + step = GLOBAL LENGTH: force that many steps on every pattern,
+      // absolute across the sections (section n, key k = n*16 + k + 1), which is
+      // what makes a chain of differently written patterns run to one bar. A
+      // bare TAP clears it and every pattern goes back to its own layout. The
+      // 606 puts these on GROUP + step and CLEAR; this machine has one free
+      // modifier, so both ride TAP and the release carries the clear.
+      //
+      // The override is a performance control, not pattern data: it is never
+      // saved, and it bypasses the part split while it is on (see pos_to_abs_).
       for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
         if (stepB[b].rising()) {
           if (tapB.held()) {
             s_tap_used = true;
-            eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
-            midi_send_pattern_dump(eng.cur_pat);
+            eng.global_len = (uint8_t)(sec * NUM_STEP_BTNS + b + 1);
           } else {
             eng.SetSectionLength(sec, (uint8_t)(b + 1));
             midi_send_layout_update(eng.cur_pat);
           }
         }
-      if (tapB.falling() && !s_tap_used) {
-        eng.SetInstLength(inst, 0);            // follow the pattern again
-        midi_send_pattern_dump(eng.cur_pat);
-      }
+      if (tapB.falling() && !s_tap_used) eng.global_len = 0;
       break;
     case TOOL_PRESCALE:
       // Steps 1-4 set the PRE SCALE outright; the LED frame shows which one the
@@ -683,18 +684,37 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       // Both rewrite every pattern in the store, so they only fire while
       // stopped — the 606 puts them on CLEAR and TAP for the same reason.
       //
-      // Loop LENGTH moved to the Length tool (TAP + step), where the 606 keeps
-      // it. This tool used to own both, which left no room to see more than the
-      // selected voice and no way to reach the master switches at all.
-      for (uint8_t b = 0; b < NUM_INSTRUMENTS; ++b)
-        if (stepB[b].rising()) {
-          eng.SetInstPoly(b, !eng.GetInstPoly(b));
-          midi_send_pattern_dump(eng.cur_pat);
+      // TAP + step = the SELECTED VOICE's own loop length (absolute, so it can
+      // run past the shown section), and a bare TAP puts that voice back to
+      // following the pattern. It lives here rather than in the Length tool
+      // because the Length tool's one modifier is spent on the global override,
+      // and because this is the length the poly switch above operates on: a row
+      // with no length of its own has nothing to free-run against.
+      // No early break out of the TAP branch: held() is still true on the pass
+      // that reports falling() (the debounce shift register reads 0b100 there),
+      // so bailing out here would mean the bare-TAP action below never runs.
+      if (tapB.held()) {
+        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
+          if (stepB[b].rising()) {
+            s_tap_used = true;
+            eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
+            midi_send_pattern_dump(eng.cur_pat);
+          }
+      } else {
+        for (uint8_t b = 0; b < NUM_INSTRUMENTS; ++b)
+          if (stepB[b].rising()) {
+            eng.SetInstPoly(b, !eng.GetInstPoly(b));
+            midi_send_pattern_dump(eng.cur_pat);
+          }
+        if (!eng.running && (stepB[14].rising() || stepB[15].rising())) {
+          eng.ApplyMasterPoly(stepB[15].rising());
+          save_dirty(eng);
+          for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
         }
-      if (!eng.running && (stepB[14].rising() || stepB[15].rising())) {
-        eng.ApplyMasterPoly(stepB[15].rising());
-        save_dirty(eng);
-        for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
+      }
+      if (tapB.falling() && !s_tap_used) {
+        eng.SetInstLength(inst, 0);            // this voice follows the pattern
+        midi_send_pattern_dump(eng.cur_pat);
       }
       break;
     case TOOL_MUTE:
@@ -857,10 +877,12 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
   uint16_t f = 0;
   switch (tool) {
     case TOOL_LENGTH: {
-      if (tapB.held()) {                       // showing the voice's own loop
-        const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
-        if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
-        break;                                 // dark = this voice follows the pattern
+      // A BLINKING marker means the global override is running the show; solid
+      // means this section's own step count. Same tell as the 606's.
+      if (eng.global_len) {
+        const uint8_t L = eng.global_len;
+        if ((uint8_t)((L - 1) >> 4) == sec && tempo_blink()) f = led_bit((uint8_t)((L - 1) & 15));
+        break;
       }
       const uint8_t L = eng.SectionLength(sec);
       if (L) f = led_bit((uint8_t)(L - 1));
@@ -914,8 +936,14 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
       break;
     }
     case TOOL_POLY:
-      // One LED per voice: lit = polymeter. The master keys sit lit as labels,
-      // and go dark while running, when they are refused.
+      // TAP held: the selected voice's loop length, dark = follows the pattern.
+      // Otherwise one LED per voice, lit = polymeter, with the master keys lit
+      // as labels — they go dark while running, when they are refused.
+      if (tapB.held()) {
+        const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
+        if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
+        break;
+      }
       f = (uint16_t)(eng.cur().poly & 0x0FFF);
       if (!eng.running) f |= led_bit(14) | led_bit(15);
       break;
