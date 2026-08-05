@@ -543,16 +543,38 @@ static void handle_pattern_clear_mode() {
 // ---------------------------------------------------------------------------
 // Tool layer
 // ---------------------------------------------------------------------------
+// TAP inside a tool is both a chord modifier (TAP + step) and an action of its
+// own on release. This latches which one it was, the way the 606 does with
+// GROUP: set when a step is chorded, so the bare-tap action is suppressed.
+static bool s_tap_used = false;
+
 static void handle_tool(uint8_t tool, uint8_t inst) {
   const uint8_t sec = disp_section;
+  if (tapB.rising()) s_tap_used = false;
 
   switch (tool) {
     case TOOL_LENGTH:
+      // Bare step = this section's step count, the stock STEP NUMBER value.
+      // TAP + step = the SELECTED VOICE's own loop length (absolute, so it can
+      // run past the section), and a bare TAP with no step chorded puts that
+      // voice back to following the pattern. That is the 606's Length tool,
+      // where the same two live on TAP+step and TAP+CLEAR; CLEAR is the gateway
+      // key here, so the release of TAP carries the second one.
       for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
         if (stepB[b].rising()) {
-          eng.SetSectionLength(sec, (uint8_t)(b + 1));
-          midi_send_layout_update(eng.cur_pat);
+          if (tapB.held()) {
+            s_tap_used = true;
+            eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
+            midi_send_pattern_dump(eng.cur_pat);
+          } else {
+            eng.SetSectionLength(sec, (uint8_t)(b + 1));
+            midi_send_layout_update(eng.cur_pat);
+          }
         }
+      if (tapB.falling() && !s_tap_used) {
+        eng.SetInstLength(inst, 0);            // follow the pattern again
+        midi_send_pattern_dump(eng.cur_pat);
+      }
       break;
     case TOOL_PRESCALE:
       // Steps 1-4 set the PRE SCALE outright; the LED frame shows which one the
@@ -565,15 +587,17 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
           midi_send_layout_update(eng.cur_pat);
         }
       break;
-    case TOOL_COPY:
-      if (stepB[0].rising()) eng.CopyPatternToBuf();
-      if (stepB[1].rising()) { eng.PastePatternFromBuf(); midi_send_pattern_dump(eng.cur_pat); }
+    case TOOL_COPY:   // 1 clear / 2 copy / 3 paste, the 606's layout
+      if (stepB[0].rising()) { eng.ClearPattern(eng.cur_pat); midi_send_pattern_dump(eng.cur_pat); }
+      if (stepB[1].rising())   eng.CopyPatternToBuf();
+      if (stepB[2].rising()) { eng.PastePatternFromBuf(); midi_send_pattern_dump(eng.cur_pat); }
       break;
-    case TOOL_XFORM:
+    case TOOL_XFORM:  // 1 rot left / 2 rot right / 3 reverse / 4 randomize
       if (stepB[0].rising()) eng.RotateInst(inst, sec, false);
       if (stepB[1].rising()) eng.RotateInst(inst, sec, true);
       if (stepB[2].rising()) eng.ReverseInst(inst, sec);
-      if (stepB[0].rising() || stepB[1].rising() || stepB[2].rising())
+      if (stepB[3].rising()) eng.RandomizeInst(inst, sec, preVal & 3);   // PRE SCALE = density
+      if (stepB[0].rising() || stepB[1].rising() || stepB[2].rising() || stepB[3].rising())
         midi_send_pattern_dump(eng.cur_pat);
       break;
     case TOOL_ACCENT:
@@ -584,42 +608,104 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
           midi_send_step_update(eng.cur_pat, INST_AC, s, eng.cur().step_get(INST_AC, s));
         }
       break;
+    // PROBABILITY and RATCHET are two-phase, and both take TAP where the 606
+    // takes CLEAR: on this machine CLEAR is the gateway key, so a tap inside a
+    // tool exits it and cannot also mean "wipe". TAP is free in every tool here.
     case TOOL_PROB:
+      // Pick: the voice's steps are lit and the ones carrying a chance blink;
+      // press a step to select it. Set: step n = fires n/16 of the time, and
+      // step 16 = ALWAYS, which frees the slot. TAP wipes the whole voice.
+      //
+      // Step 16 used to pass 16 straight into prob_set, where it overflowed the
+      // instrument nibble: the press looked dead and cost a slot. See prob_set.
       if (s_prob_sel == 0xFF) {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
-          if (stepB[b].rising()) s_prob_sel = (uint8_t)(sec * NUM_STEP_BTNS + b);
+          if (stepB[b].rising()) { s_prob_sel = (uint8_t)(sec * NUM_STEP_BTNS + b); break; }
+        if (tapB.rising()) {
+          eng.cur().prob_clear_inst(inst);
+          eng.mark_pat_dirty(eng.cur_pat);
+          midi_send_pattern_dump(eng.cur_pat);
+        }
       } else {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
-            eng.cur().prob_set(inst, s_prob_sel, (uint8_t)(b + 1));
+            eng.cur().prob_set(inst, s_prob_sel, (uint8_t)((b + 1) & 15));
             eng.mark_pat_dirty(eng.cur_pat);
             s_prob_sel = 0xFF;
             midi_send_pattern_dump(eng.cur_pat);
+            break;
           }
+        if (tapB.rising()) {                     // back to always, stay in pick
+          eng.cur().prob_set(inst, s_prob_sel, 0);
+          eng.mark_pat_dirty(eng.cur_pat);
+          s_prob_sel = 0xFF;
+          midi_send_pattern_dump(eng.cur_pat);
+        }
       }
       break;
     case TOOL_RATCHET:
+      // Same shape. Set: steps 1/2/3 = 2x/3x/4x retrigger, anything above also
+      // 4x (ratchet_set clamps), TAP = back to a single hit. The set phase used
+      // to read only steps 1-4 and ignore the rest, so most of the row was dead
+      // with no way to tell that from a missed press.
       if (s_ratchet_sel == 0xFF) {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
-          if (stepB[b].rising()) s_ratchet_sel = (uint8_t)(sec * NUM_STEP_BTNS + b);
+          if (stepB[b].rising()) { s_ratchet_sel = (uint8_t)(sec * NUM_STEP_BTNS + b); break; }
+        if (tapB.rising()) {
+          eng.cur().ratchet_clear_inst(inst);
+          eng.mark_pat_dirty(eng.cur_pat);
+          midi_send_pattern_dump(eng.cur_pat);
+        }
       } else {
-        for (uint8_t b = 0; b < 4; ++b)
+        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
-            eng.cur().ratchet_set(inst, s_ratchet_sel, b);   // b = 0 clears
+            eng.cur().ratchet_set(inst, s_ratchet_sel, (uint8_t)(b + 1));
             eng.mark_pat_dirty(eng.cur_pat);
             s_ratchet_sel = 0xFF;
             midi_send_pattern_dump(eng.cur_pat);
+            break;
           }
+        if (tapB.rising()) {
+          eng.cur().ratchet_set(inst, s_ratchet_sel, 0);
+          eng.mark_pat_dirty(eng.cur_pat);
+          s_ratchet_sel = 0xFF;
+          midi_send_pattern_dump(eng.cur_pat);
+        }
       }
       break;
     case TOOL_POLY:
-      for (uint8_t b = 0; b < 15; ++b)
-        if (stepB[b].rising()) eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
-      if (stepB[15].rising()) eng.SetInstPoly(inst, !eng.GetInstPoly(inst));
+      // Steps 1-12 = the twelve voices, LED lit = POLYMETER (that row's counter
+      // free-runs against the bar), dark = bar-reset (the row restarts with the
+      // pattern). One key per voice, so the whole machine's loop behaviour is
+      // one glance instead of one voice at a time through the INSTRUMENT dial.
+      //
+      // 15 = master all rows to bar-reset, 16 = master all rows to polymeter.
+      // Both rewrite every pattern in the store, so they only fire while
+      // stopped — the 606 puts them on CLEAR and TAP for the same reason.
+      //
+      // Loop LENGTH moved to the Length tool (TAP + step), where the 606 keeps
+      // it. This tool used to own both, which left no room to see more than the
+      // selected voice and no way to reach the master switches at all.
+      for (uint8_t b = 0; b < NUM_INSTRUMENTS; ++b)
+        if (stepB[b].rising()) {
+          eng.SetInstPoly(b, !eng.GetInstPoly(b));
+          midi_send_pattern_dump(eng.cur_pat);
+        }
+      if (!eng.running && (stepB[14].rising() || stepB[15].rising())) {
+        eng.ApplyMasterPoly(stepB[15].rising());
+        save_dirty(eng);
+        for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
+      }
       break;
     case TOOL_MUTE:
+      // Steps 1-12 are the voices (1 = ACCENT). Only 12 of the 16 keys can be a
+      // voice here, so the spare pair carries the 606's all/none, which it puts
+      // on CLEAR and TAP — neither of which is free inside a tool on this
+      // machine. 15 = mute everything but accent, 16 = unmute everything.
       for (uint8_t b = 0; b < NUM_INSTRUMENTS; ++b)
         if (stepB[b].rising()) eng.mute_mask ^= (uint16_t)1 << b;
+      if (stepB[14].rising()) eng.mute_mask = (uint16_t)(0x0FFF & ~1u);
+      if (stepB[15].rising()) eng.mute_mask = 0;
       break;
     case TOOL_RESLICE: {
       uint8_t win = 0;
@@ -771,6 +857,11 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
   uint16_t f = 0;
   switch (tool) {
     case TOOL_LENGTH: {
+      if (tapB.held()) {                       // showing the voice's own loop
+        const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
+        if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
+        break;                                 // dark = this voice follows the pattern
+      }
       const uint8_t L = eng.SectionLength(sec);
       if (L) f = led_bit((uint8_t)(L - 1));
       break;
@@ -782,28 +873,52 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
       for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
         if (eng.cur().step_get(INST_AC, (uint8_t)(sec * NUM_STEP_BTNS + b))) f |= led_bit(b);
       break;
-    case TOOL_PROB:
-      if (s_prob_sel != 0xFF) {
-        if (tempo_blink() && (s_prob_sel >> 4) == sec) f = led_bit((uint8_t)(s_prob_sel & 15));
+    // PROBABILITY / RATCHET, both phases. Pick shows the voice's PATTERN with
+    // the affected steps blinking on top, so you can see what you are aiming at;
+    // set shows the current VALUE as a bar, so the tool says what it is holding
+    // instead of leaving you to press and listen. Both used to show only a bare
+    // list of affected steps, and nothing at all about the value.
+    case TOOL_PROB: {
+      const Pattern &p = eng.cur();
+      if (s_prob_sel == 0xFF) {
+        uint16_t pm = 0;
+        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
+          const uint8_t s = (uint8_t)(sec * NUM_STEP_BTNS + b);
+          if (p.step_get(inst, s)) f |= led_bit(b);
+          if (p.prob_get(inst, s)) pm |= led_bit(b);
+        }
+        f = tempo_blink() ? (uint16_t)(f | pm) : (uint16_t)(f & ~pm);
       } else {
-        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
-          if (eng.cur().prob_get(inst, (uint8_t)(sec * NUM_STEP_BTNS + b))) f |= led_bit(b);
+        const uint8_t v = eng.cur().prob_get(inst, s_prob_sel);
+        const uint8_t n = v ? v : NUM_STEP_BTNS;      // no slot = always = full bar
+        for (uint8_t b = 0; b < n; ++b) f |= led_bit(b);
+        if (tempo_blink() && (s_prob_sel >> 4) == sec) f ^= led_bit((uint8_t)(s_prob_sel & 15));
       }
-      break;
-    case TOOL_RATCHET:
-      if (s_ratchet_sel != 0xFF) {
-        if (tempo_blink() && (s_ratchet_sel >> 4) == sec) f = led_bit((uint8_t)(s_ratchet_sel & 15));
-      } else {
-        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
-          if (eng.cur().ratchet_get(inst, (uint8_t)(sec * NUM_STEP_BTNS + b))) f |= led_bit(b);
-      }
-      break;
-    case TOOL_POLY: {
-      const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
-      if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
-      if (eng.GetInstPoly(inst)) f |= led_bit(15);
       break;
     }
+    case TOOL_RATCHET: {
+      const Pattern &p = eng.cur();
+      if (s_ratchet_sel == 0xFF) {
+        uint16_t rm = 0;
+        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
+          const uint8_t s = (uint8_t)(sec * NUM_STEP_BTNS + b);
+          if (p.step_get(inst, s)) f |= led_bit(b);
+          if (p.ratchet_get(inst, s)) rm |= led_bit(b);
+        }
+        f = tempo_blink() ? (uint16_t)(f | rm) : (uint16_t)(f & ~rm);
+      } else {
+        const uint8_t e = eng.cur().ratchet_get(inst, s_ratchet_sel);
+        for (uint8_t b = 0; b < (e ? e : 1); ++b) f |= led_bit(b);   // 1 = single hit
+        if (tempo_blink() && (s_ratchet_sel >> 4) == sec) f ^= led_bit((uint8_t)(s_ratchet_sel & 15));
+      }
+      break;
+    }
+    case TOOL_POLY:
+      // One LED per voice: lit = polymeter. The master keys sit lit as labels,
+      // and go dark while running, when they are refused.
+      f = (uint16_t)(eng.cur().poly & 0x0FFF);
+      if (!eng.running) f |= led_bit(14) | led_bit(15);
+      break;
     case TOOL_MUTE:    f = (uint16_t)(eng.mute_mask & 0x0FFF); break;
     case TOOL_RESLICE: f = eng.reslice_on ? led_bit((uint8_t)(eng.reslice_len - 1)) : 0; break;
     case TOOL_ARP:

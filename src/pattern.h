@@ -182,7 +182,18 @@ struct Pattern {
       if (pstep[k] == s && (pval[k] >> 4) == inst) return (uint8_t)(pval[k] & 15);
     return 0;
   }
+  // v is a chance in 16ths, 1..15; 0 frees the slot, which is "always plays".
+  //
+  // CLAMPED, because the value shares a byte with the instrument index and an
+  // out-of-range chance does not overflow harmlessly: v = 16 makes
+  // (inst << 4) | v read back as instrument inst+1 with chance 0. The panel
+  // tool used to hand exactly that in from step 16, so the press quietly
+  // rewrote the slot onto the next instrument, did nothing audible, and burned
+  // one of the PROB_SLOTS. Step 16 now means "always" at the call site, and the
+  // clamp keeps any other caller (a pushed pattern, the editor) honest.
   bool prob_set(uint8_t inst, uint8_t s, uint8_t v) {
+    if (v > 15) v = 15;
+    if (inst >= NUM_INSTRUMENTS) return false;
     uint8_t free_k = 0xFF;
     for (uint8_t k = 0; k < PROB_SLOTS; ++k) {
       if (pstep[k] == s && (pval[k] >> 4) == inst) {

@@ -2,6 +2,43 @@
 
 Notable changes per release. Dates are release dates.
 
+## v0.3 (unreleased)
+
+### Fixed
+
+**Probability could not be set to "always", and step 16 corrupted the slot.** The panel
+tool passed the raw key number into `prob_set`, so step 16 wrote a chance of 16 — which
+does not fit the nibble it shares with the instrument index, and read back as the *next*
+instrument with a chance of zero. The press looked dead, did nothing audible, and consumed
+one of the 40 probability slots. Step 16 now means "always" (it frees the slot), and
+`prob_set` clamps on both machines.
+
+**The two-phase tools showed no value.** PROBABILITY and RATCHET drew a bare list of
+affected steps and, once a step was selected, nothing but a blinking cursor — so the only
+way to find out what a step was set to was to press something and listen. Both phases now
+follow the 606: the pick phase draws the voice's pattern with the affected steps blinking
+on top, and the set phase draws the current value as a bar.
+
+**RATCHET ignored most of its own row.** The set phase read only steps 1-4; the rest of the
+row did nothing, which is indistinguishable from a missed press. Anything above step 3 now
+also means 4x, as on the 606.
+
+### Added
+
+- **TAP as the tool layer's second key.** CLEAR is the gateway on this machine, so it
+  cannot also mean "wipe" inside a tool the way it does on the 606. TAP now carries those
+  actions: wipe a voice's probability or ratchets, or reset one step.
+- **POLYMETER shows every voice at once** — one key per voice, lit = free-running against
+  the bar — with master all-rows switches on steps 15/16. It previously showed only the
+  voice on the INSTRUMENT dial and had no way to reach the master switches. Per-voice loop
+  LENGTH moved to the Length tool (TAP + step), where the 606 keeps it.
+- **MUTE all / unmute all** on steps 15/16, and **COPY** gained clear-pattern on step 1,
+  **TRANSFORM** gained randomize on step 4.
+- **Web editor: probability and ratchet are editable per step.** The editor round-tripped
+  both fields but exposed no way to set them; it now has a Steps / Probability / Ratchet
+  layer selector, with per-voice loop length and polymeter on each row. Edits coalesce into
+  one pattern push, since neither field has a per-step wire message.
+
 ## v0.2 — 2026-08-04
 
 All six panel bugs in this release were found on hardware and fixed against either a

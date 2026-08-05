@@ -161,6 +161,22 @@ input[type="file"] { display: none; }
 .dg-tool { width: 18px; height: 20px; border: var(--rule-sm); margin-right: -1px; background: var(--white); color: var(--gray-3); font-size: 9px; font-weight: 900; cursor: pointer; font-family: var(--font); border-radius: 0; padding: 0; display: flex; align-items: center; justify-content: center; transition: all 0.08s; }
 .dg-tool:last-child { margin-right: 0; }
 .dg-tool:hover { background: var(--black); color: var(--white); }
+.dg-tool.is-set { background: var(--black); color: var(--white); }
+.dg-tool.is-moot { opacity: 0.35; }
+.dg-tool-len { width: 26px; font-size: 8px; }
+.layer-bar { display: flex; align-items: center; gap: 0; margin: 0 0 6px 0; flex-wrap: wrap; }
+.layer-btn { border: var(--rule); margin-right: -1px; background: var(--white); color: var(--black); font-family: var(--font); font-size: 10px; font-weight: 900; letter-spacing: 0.06em; text-transform: uppercase; padding: 5px 11px; cursor: pointer; border-radius: 0; transition: all 0.08s; }
+.layer-btn:hover { background: var(--gray-1); }
+.layer-btn.is-on { background: var(--black); color: var(--white); }
+.layer-hint { margin-left: 12px; font-size: 10px; color: var(--gray-3); letter-spacing: 0.02em; }
+.dg-val { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 900; font-family: var(--font); pointer-events: none; }
+.dg-cell.is-problayer.is-on, .dg-cell.is-ratlayer.is-on { background: var(--gray-2); }
+.dg-cell.is-problayer.dg-row-ac.is-on, .dg-cell.is-ratlayer.dg-row-ac.is-on { background: #e6a0a0; }
+.dg-cell.is-problayer.has-val { background: var(--black); }
+.dg-cell.is-problayer.has-val .dg-val { color: var(--white); }
+.dg-cell.is-ratlayer.has-val { background: var(--red); }
+.dg-cell.is-ratlayer.has-val .dg-val { color: var(--white); }
+.dg-cell.is-problayer:not(.is-on), .dg-cell.is-ratlayer:not(.is-on) { cursor: default; }
 
 .dg-cell { height: 34px; min-width: 0; border-right: var(--rule-sm); border-bottom: var(--rule-sm); background: var(--white); cursor: pointer; position: relative; transition: background 0.05s; touch-action: none; }
 .dg-cell.dg-row-ac { border-bottom: var(--rule); }
@@ -326,6 +342,7 @@ input[type="file"] { display: none; }
       <span class="seq-hint" id="seqHint"></span>
     </div>
     <div class="part-strip" id="partStrip"></div>
+    <div class="layer-bar" id="layerBar"></div>
     <div class="seq-grid-wrap"><div class="drum-grid" id="grid"></div></div>
   </div>
 
@@ -435,6 +452,56 @@ const TRACK_BYTES = 1 + TRKMAX;                // 65
 const MFR = 0x7D;
 const SPB = [3,6,4,8];                         // steps per beat, by pre-scale
 const PART_NAMES = ['1st Part','2nd Part','3rd (SuperOS)','4th (SuperOS)'];
+
+// Which layer the grid edits. The pattern carries three per-step values and the
+// grid can only show one at a time, so this picks it: the step itself, its play
+// chance, or its retrigger count. Matches the 808's own PROBABILITY and RATCHET
+// tools, which are the same data reached from the panel.
+let gridLayer = 'steps';                       // 'steps' | 'prob' | 'ratchet'
+
+// --- sparse (instrument, step) tables -------------------------------------
+// Same shape and the same rules as pattern.h: a free slot is pstep/rstep 0xFF,
+// the value byte packs (instrument << 4) | value, and value 0 means "no slot",
+// i.e. always plays / single hit. Chance is in 16ths (1..15); ratchet is the
+// number of EXTRA hits (1..3), so 3 sounds four times.
+function slotGet(steps, vals, n, inst, s){
+  for(let k=0;k<n;k++) if(steps[k] === s && (vals[k] >> 4) === inst) return vals[k] & 15;
+  return 0;
+}
+function slotSet(steps, vals, n, inst, s, v, max){
+  if(v > max) v = max;
+  if(v < 0) v = 0;
+  let free = -1;
+  for(let k=0;k<n;k++){
+    if(steps[k] === s && (vals[k] >> 4) === inst){
+      if(v) vals[k] = (inst << 4) | v; else steps[k] = 0xFF;
+      return true;
+    }
+    if(steps[k] === 0xFF && free < 0) free = k;
+  }
+  if(!v) return true;
+  if(free < 0) return false;                   // table full: the edit is refused
+  steps[free] = s; vals[free] = (inst << 4) | v;
+  return true;
+}
+const probGet = (p,i,s)   => slotGet(p.pstep, p.pval, PROB_SLOTS, i, s);
+const probSet = (p,i,s,v) => slotSet(p.pstep, p.pval, PROB_SLOTS, i, s, v, 15);
+const ratGet  = (p,i,s)   => slotGet(p.rstep, p.rval, RATCHET_SLOTS, i, s);
+const ratSet  = (p,i,s,v) => slotSet(p.rstep, p.rval, RATCHET_SLOTS, i, s, v, 3);
+
+// Probability and ratchet have no per-step wire message the way steps do
+// (0x13), so an edit to either pushes the whole pattern. Coalesced, because a
+// pattern is ~270 bytes on a 31250-baud line and click-dragging a column would
+// otherwise queue a dump per cell.
+let pushTimer = null;
+function pushPatternSoon(){
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => {
+    const raw = serializePattern(curPat());
+    const x = xorSum(raw);
+    sendCmd(0x12, [patIndex(), x & 0x7F, (x>>7)&1, ...pack7(raw)]);
+  }, 180);
+}
 
 function emptyPattern(){
   return {
@@ -758,6 +825,29 @@ function renderParts(){
   box.appendChild(c);
 }
 
+// The Steps / Probability / Ratchet selector above the grid.
+function renderLayerBar(){
+  const bar = $('layerBar');
+  if(!bar) return;
+  bar.innerHTML = '';
+  const layers = [['steps','Steps'],['prob','Probability'],['ratchet','Ratchet']];
+  for(const [id,label] of layers){
+    const b = document.createElement('button');
+    b.className = 'layer-btn' + (gridLayer === id ? ' is-on' : '');
+    b.textContent = label;
+    b.onclick = () => { gridLayer = id; renderLayerBar(); renderGrid(); };
+    bar.appendChild(b);
+  }
+  const hint = document.createElement('span');
+  hint.className = 'layer-hint';
+  hint.textContent = gridLayer === 'steps'
+    ? 'click a cell to toggle the step'
+    : (gridLayer === 'prob'
+        ? 'click a lit step to raise its chance (16ths), shift-click to lower; blank = always'
+        : 'click a lit step to add a retrigger, shift-click to remove; blank = single hit');
+  bar.appendChild(hint);
+}
+
 function renderGrid(){
   const g = $('grid'); g.innerHTML = '';
   const p = curPat();
@@ -801,6 +891,33 @@ function renderGrid(){
     }));
     tools.appendChild(mkTool('\u2039','shift left', () => { shiftRow(i,-1); }));
     tools.appendChild(mkTool('\u203A','shift right',() => { shiftRow(i,+1); }));
+
+    // Per-row loop length and loop mode \u2014 the POLYMETER tool on the panel.
+    // ilen 0 = follow the pattern. With a length set, the row either restarts
+    // with the bar (bar-reset) or free-runs against it (polymeter), which is
+    // what walks a figure across the bar.
+    const il = p.ilen[i];
+    const lenBtn = mkTool(il ? String(il) : '\u2013',
+      'loop length for this voice (\u2013 = follow the pattern) \u2014 click +1, shift-click -1',
+      ev => {
+        let nv = p.ilen[i] + (ev.shiftKey ? -1 : 1);
+        if(nv > 64) nv = 0;
+        if(nv < 0) nv = 64;
+        p.ilen[i] = nv;
+        pushPatternSoon(); renderGrid();
+      });
+    lenBtn.classList.add('dg-tool-len');
+    if(il) lenBtn.classList.add('is-set');
+    tools.appendChild(lenBtn);
+
+    const polyOn = (p.poly >> i) & 1;
+    const polyBtn = mkTool('\u221E',
+      polyOn ? 'polymeter: this voice free-runs against the bar'
+             : 'bar-reset: this voice restarts with the pattern',
+      () => { p.poly ^= (1 << i); pushPatternSoon(); renderGrid(); });
+    if(polyOn) polyBtn.classList.add('is-set');
+    if(!il) polyBtn.classList.add('is-moot');   // no length: nothing to loop
+    tools.appendChild(polyBtn);
     lbl.appendChild(tools);
     g.appendChild(lbl);
 
@@ -808,19 +925,56 @@ function renderGrid(){
       const sec = c >> 4, k = c & 15;
       const live = k < p.seclen[sec];
       const on = (p.steps[i][sec] >> k) & 1;
+      const abs = sec * 16 + k;
       const d = document.createElement('div');
       d.className = 'dg-cell'
         + (i === 0 ? ' dg-row-ac' : '')
         + (on ? ' is-on' : '')
         + (live ? (k % spb === 0 && k ? ' is-beat' : '') : ' is-beyond');
       d.dataset.col = c;
+
+      // In the prob/ratchet layers the step itself is drawn dimmed and the
+      // value sits on top of it, so you can still see the pattern you are
+      // annotating. A value only means anything on a step that is ON — the
+      // engine rolls the dice per HIT — so cells that are off are inert.
+      if(gridLayer !== 'steps'){
+        const isProb = gridLayer === 'prob';
+        const v = isProb ? probGet(p,i,abs) : ratGet(p,i,abs);
+        d.classList.add(isProb ? 'is-problayer' : 'is-ratlayer');
+        if(on && v){
+          d.classList.add('has-val');
+          const t = document.createElement('span');
+          t.className = 'dg-val';
+          t.textContent = isProb ? String(v) : String(v + 1) + '×';
+          d.appendChild(t);
+        }
+        if(live && on){
+          d.title = isProb
+            ? 'chance ' + (v ? (v/16*100).toFixed(0) + '%' : 'always')
+                        + ' — click +1, shift-click -1'
+            : (v ? (v+1) + ' hits' : 'single hit') + ' — click +1, shift-click -1';
+          d.onclick = ev => {
+            const max = isProb ? 15 : 3;
+            let nv = v + (ev.shiftKey ? -1 : 1);
+            if(nv > max) nv = 0;
+            if(nv < 0) nv = max;
+            const ok = isProb ? probSet(p,i,abs,nv) : ratSet(p,i,abs,nv);
+            if(!ok){ log((isProb?'probability':'ratchet') + ' table full', 'log-warn'); return; }
+            pushPatternSoon();
+            renderGrid();
+          };
+        }
+        g.appendChild(d);
+        continue;
+      }
+
       if(live){
         d.onclick = () => {
           p.steps[i][sec] ^= (1<<k);
           // Live edit: push this one step to the 808 immediately (0x13). The
           // panel does the same in the other direction with 0x16, so an edit
           // made on either side shows up on the other without a manual send.
-          sendCmd(0x13, [patIndex(), i, sec * 16 + k, (p.steps[i][sec] >> k) & 1]);
+          sendCmd(0x13, [patIndex(), i, abs, (p.steps[i][sec] >> k) & 1]);
           renderGrid(); renderPills();
         };
       }
@@ -867,7 +1021,7 @@ function render(){
   $('seqHint').innerHTML = curSlot >= NBASIC
     ? 'This is an <b>INTRO / FILL IN</b> slot &mdash; TAP inserts it, AUTO FILL IN schedules it.'
     : `Step count is per part; <b>A and B share the layout</b>, so changing it here changes both. ${tot} of 64 steps used.`;
-  renderTabs(); renderPills(); renderParts(); renderGrid();
+  renderTabs(); renderPills(); renderParts(); renderLayerBar(); renderGrid();
 }
 
 // ---------------------------------------------------------------------------
