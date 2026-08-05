@@ -565,7 +565,13 @@ void midi_tx_service(Engine &eng) {
     flags |= 0x01;
 #endif
     if (g_panel_map.magic == PANELMAP_MAGIC) flags |= 0x04;   // calibrated
-    const uint8_t b[3] = { 0, 1, flags };                     // v0.1
+    // Version comes from platformio.ini via tools/version_flag.py, so a release
+    // cannot ship a binary that reports the previous version.
+#ifndef SUPEROS_VER_MAJOR
+#define SUPEROS_VER_MAJOR 0
+#define SUPEROS_VER_MINOR 0
+#endif
+    const uint8_t b[3] = { (uint8_t)SUPEROS_VER_MAJOR, (uint8_t)SUPEROS_VER_MINOR, flags };
     send_short(0x61, b, 3);
   }
 

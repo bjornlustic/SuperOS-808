@@ -95,8 +95,14 @@ pio run -e bootloader -e flash-service -e combined
 | `flash-service` | SPM flash-write service at 0x1FE00; install once over SysEx |
 | `fuses` | `lfuse=0xDF hfuse=0xD2`, blank chips only |
 
-Outputs land in the repo root: `SuperOS-808_v0.1_<env>_<rev>.syx` to flash over MIDI, and
+Outputs land in the repo root: `SuperOS-808_v<ver>_<env>_<rev>.syx` to flash over MIDI, and
 `-full.hex` (app + bootloader + service) for ISP.
+
+Prebuilt SuperOS builds are on the [releases
+page](https://github.com/bjornlustic/SuperOS-808/releases); every push also builds them as
+workflow artifacts. **Emulator builds are never published** — they compile in the
+copyrighted program image, so `combined` is a local build only. See
+[CHANGELOG.md](CHANGELOG.md) for what changed per release.
 
 USB is deliberately off. A live USB engine at 16 MHz measurably corrupts the high-impedance
 panel matrix whether or not a host is attached, so all MIDI runs over DIN.

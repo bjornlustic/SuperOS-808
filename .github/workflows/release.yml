@@ -1,0 +1,182 @@
+# Build the firmware on every push, and publish a release when a v* tag lands.
+#
+# WHAT CI CAN AND CANNOT BUILD
+# ----------------------------
+# Not the `combined` environment, ever. That one compiles the µPD650C-085
+# program image in, the program is copyrighted, and the image header is
+# gitignored precisely so it never leaves a personal checkout. CI builds
+# `app-flash` (SuperOS, no emulator), the bootloader and the SPM flash service —
+# which is the set that is ours to distribute.
+#
+# The guard job below fails the run if that header ever appears in the tree, so
+# an accidental `git add -f` cannot turn into a public download.
+name: build
+
+on:
+  push:
+    branches: ["**"]     # every branch: a summary and artifacts on each push
+    tags: ["v*"]         # a tag additionally publishes a release
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed only by the release step on a tag
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # version_flag.py and the summary want history + tags
+
+      - name: Refuse to build with a program image in the tree
+        run: |
+          if [ -e src/d650/image_embed.h ]; then
+            echo "::error::src/d650/image_embed.h is present in the checkout."
+            echo "That header carries the copyrighted uPD650C-085 program and must"
+            echo "never reach a public artifact. It is gitignored; if it is here,"
+            echo "someone force-added it. Remove it from the repository history."
+            exit 1
+          fi
+          echo "no program image in the tree"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio intelhex
+
+      # Order matters: makesyx.py folds the flash-service and bootloader images
+      # into the app's .syx / -full.hex, so those two have to exist first.
+      - name: Build
+        run: |
+          set -o pipefail
+          pio run -e bootloader -e flash-service 2>&1 | tee build.log
+          pio run -e app-flash 2>&1 | tee -a build.log
+
+      - name: Collect artifacts
+        id: collect
+        run: |
+          mkdir -p dist
+          cp SuperOS-808_*_app-flash_*.syx dist/
+          cp SuperOS-808_*_app-flash_*-full.hex dist/
+          cp service-install.syx dist/
+          cp .pio/build/bootloader/firmware.hex dist/SuperOS-808_bootloader.hex
+          VER=$(sed -n 's/^custom_project_version *= *//p' platformio.ini | head -1)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          ls -la dist/
+
+      # Belt and braces on the same rule as the guard job. `app-flash` excludes
+      # the emulator through build_src_filter, so no d650 object should exist in
+      # its build tree at all; if one does, the filter changed and the artifact
+      # may carry the program image. Checking the objects rather than searching
+      # the binary is the honest test — the .syx is 7-bit packed, so grepping it
+      # for image bytes finds nothing whether or not they are in there.
+      - name: Verify the public build has no emulator in it
+        run: |
+          if [ -d .pio/build/app-flash/src/d650 ]; then
+            echo "::error::emulator objects compiled into the public build:"
+            find .pio/build/app-flash/src/d650 -type f
+            exit 1
+          fi
+          echo "no emulator objects in the public build:"
+          ls .pio/build/app-flash/src/
+
+      - name: Build summary
+        run: |
+          VER="${{ steps.collect.outputs.version }}"
+          {
+            echo "## SuperOS-808 v$VER"
+            echo
+            echo "\`${GITHUB_REF_NAME}\` at \`$(git rev-parse --short HEAD)\`"
+            echo
+            echo "### Size"
+            echo '```'
+            grep -E "^(RAM|Flash):" build.log || true
+            echo '```'
+            echo "### Artifacts"
+            echo '| file | bytes |'
+            echo '|---|---:|'
+            for f in dist/*; do
+              printf '| %s | %s |\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"
+            done
+            echo
+            echo "### Changes"
+            PREV=$(git describe --tags --abbrev=0 --exclude="$GITHUB_REF_NAME" 2>/dev/null || true)
+            if [ -n "$PREV" ]; then
+              echo "since \`$PREV\`:"
+              echo
+              git log --no-merges --pretty='- %s (%h)' "$PREV..HEAD"
+            else
+              git log --no-merges --pretty='- %s (%h)' -20
+            fi
+            echo
+            echo "> Emulator builds are not published: they compile in the"
+            echo "> copyrighted program image. Build \`combined\` locally with your own."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperOS-808-${{ steps.collect.outputs.version }}-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
+      # NEEDS "Read and write permissions" under Settings -> Actions -> General
+      # -> Workflow permissions. With the read-only default, GITHUB_TOKEN cannot
+      # create a release and this step fails; the artifacts are still attached to
+      # the run by the upload step above, and the release can be cut by hand with
+      #   gh release create <tag> dist/*
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="${{ steps.collect.outputs.version }}"
+          NOTES=notes.md
+          {
+            echo "Firmware for the Roland TR-808, for the AT90USB1286 CPU replacement board."
+            echo
+            echo "### Install"
+            echo
+            echo "**Over MIDI** (the usual way): hold STEP 1 at power-on to enter the bootloader,"
+            echo "then send \`SuperOS-808_v${VER}_app-flash_*.syx\` to the 808's MIDI IN. The SPM"
+            echo "flash service is bundled in that file, so patterns persist across power-off."
+            echo "\`tools/send_syx.py\` throttles the transfer correctly; a plain SysEx librarian"
+            echo "may not."
+            echo
+            echo "**Over ISP** (fresh board): flash \`*-full.hex\`, which carries the app, the"
+            echo "bootloader and the flash service. Set fuses first with \`pio run -e fuses\`."
+            echo
+            echo "### What is not here"
+            echo
+            echo "The emulator build. It compiles in the µPD650C-085 program image, that program"
+            echo "is copyrighted, and no image ships with this project. To run it, supply your own"
+            echo "read from a chip you are entitled to read and build \`combined\` locally:"
+            echo
+            echo '```'
+            echo "python3 tools/d650/make_image_embed.py <your-transfer.syx>"
+            echo "pio run -e combined"
+            echo '```'
+            echo
+            if [ -f CHANGELOG.md ]; then
+              echo "### Changes"
+              echo
+              awk '/^## /{n++} n==1' CHANGELOG.md | tail -n +2
+            fi
+          } > "$NOTES"
+          # Idempotent: a release cut by hand before the tag landed (or a re-run
+          # of this job) updates in place instead of failing the build.
+          gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "SuperOS-808 $GITHUB_REF_NAME" \
+              --notes-file "$NOTES" \
+            || gh release upload "$GITHUB_REF_NAME" dist/* --clobber

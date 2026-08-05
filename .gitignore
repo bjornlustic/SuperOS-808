@@ -16,6 +16,7 @@ src/d650/image_embed.h
 *.json
 docs/
 
-# notes stay local; README ships
+# notes stay local; README and the changelog ship
 *.md
 !README.md
+!CHANGELOG.md

@@ -14,3 +14,14 @@ except Exception:
     rev = "unknown"
 
 env.Append(CPPDEFINES=[("SUPEROS_VERSION", env.StringifyMacro(f"{ver} {rev}"))])
+
+# Same version as two integers, for the SysEx device-info reply (0x61). It used
+# to be written out by hand there and drifted from this file the moment the
+# version moved, which is the sort of thing nobody notices until a released
+# binary reports the previous version to the editor.
+maj, _, minor = str(ver).partition(".")
+try:
+    maj_i, min_i = int(maj), int(minor or 0)
+except ValueError:
+    maj_i, min_i = 0, 0
+env.Append(CPPDEFINES=[("SUPEROS_VER_MAJOR", maj_i), ("SUPEROS_VER_MINOR", min_i)])
