@@ -15,7 +15,10 @@
 //
 // Switching:
 //   - SysEx `F0 7D 4D <fw> F7` from either firmware (0 = SuperOS, 1 = emulator)
-//   - the config menu (double-tap CLEAR, step 9, long-press CLEAR to confirm)
+//   - SuperOS -> emulator: the config menu (double-tap CLEAR, then step 9)
+//   - emulator -> SuperOS: double-press CLEAR. The emulated machine has no menu
+//     to put this in, so the AVR bridge owns the gesture and keeps the key away
+//     from the emulated CPU until it resolves (see emu_avr.cpp).
 //   - power-on escape: hold STEP 1 + STEP 16 while switching on -> boots SuperOS
 //     regardless of the stored selection. Step keys are used deliberately: they
 //     are the one input whose matrix position needs no calibration, and this

@@ -153,27 +153,33 @@ inline void PanelMap::SetDefaults() {
   clear_bit = 3;             // SW2 -> D15 -> PA3, confirmed on the drawing
 
   // --- PRE SCALE (SW7) on PH1, PA0-1 --------------------------------------
-  // CORRECTED AGAINST THE EMULATOR (2026-08-04). The codes below are pairwise
-  // swapped from the earlier schematic reading, which had:
-  //   1 = 3 (D6+D7)   2 = 1 (D5)   3 = 2 (D4)   4 = 0 (no diode)
-  // and made detents 1/2 and 3/4 play each other's subdivision in SuperOS.
+  // The schematic reading, restored: 1 = D6+D7 = 3, 2 = D5 = 1, 3 = D4 = 2,
+  // 4 = no diode = 0.
   //
-  // The emulator is the reference here, and it is a stronger one than the 1981
-  // drawing: in emulator mode nothing in this file is consulted. emu_avr.cpp
-  // hands the raw PH1 x PA0-1 bits to the emulated CPU (H.in[20..21]) and its
-  // own decode runs, so the emulator plays the right subdivision at every
-  // detent while SuperOS was pairwise off. Two decodes of the same bits that
-  // disagree means the table is wrong, not the panel.
+  // MEASURED ON HARDWARE (2026-08-04). A previous pass pairwise-swapped these
+  // (1=1, 2=3, 3=0, 4=2) on the theory that the emulator's own decode of the
+  // same bits was the stronger reference. It is not — the emulator's decode is
+  // the 1981 program's, and it never disagreed with the drawing. What that
+  // swap actually produced on the machine is a dial where every detent selects
+  // its pair partner: detent 1 -> PRE SCALE 2, 2 -> 1, 3 -> 4, 4 -> 3, which is
+  // exactly the permutation those swapped codes describe. Read the raw code at
+  // a known detent from the `F0 7D 3B F7` probe before touching this table
+  // again; the panel decode is the one part of this firmware where "it sounds
+  // wrong" and "it reads wrong" have different fixes.
   //
-  // Cross-check that this is right rather than merely different: it leaves
-  // detents 1 and 3 on the subdivisions the owner's manual pins them to
-  // (PRESCALE_TICKS in pattern.h is indexed by DETENT, not by code, and stays
-  // as it was). OM p.16 sets PRE SCALE 1 for a 12-step 4/4 measure = 3 steps
-  // per beat, and p.13 / p.15 set PRE SCALE 3 for both a 16-step 4/4 and a
-  // 12-step 3/4 measure = 4 steps per beat. Swapping PRESCALE_TICKS instead
-  // would produce identical panel behaviour and break both of those, which is
-  // how you tell the two candidate fixes apart.
-  pre_code[0] = 1;  pre_code[1] = 3;  pre_code[2] = 0;  pre_code[3] = 2;
+  // Which entry to change is settled by the fact that PRESCALE_TICKS in
+  // pattern.h is indexed by DETENT, not by code, and is pinned by the owner's
+  // manual: OM p.16 sets PRE SCALE 1 for a 12-step 4/4 measure = 3 steps per
+  // beat, p.13 / p.15 set PRE SCALE 3 for a 16-step 4/4 and a 12-step 3/4 = 4
+  // steps per beat. Swapping PRESCALE_TICKS instead gives identical panel
+  // behaviour while silently breaking both of those anchors, so it looks like a
+  // fix and is not one. Fix the codes here.
+  //
+  // A CALIBRATED TABLE OVERRIDES THIS. If the block store holds a map with
+  // PANELMAP_MAGIC, load_panel_map() replaces the whole struct, defaults
+  // included — so a device that has been through the guided walk keeps whatever
+  // that walk recorded and must be re-walked, not reflashed, to pick this up.
+  pre_code[0] = 3;  pre_code[1] = 1;  pre_code[2] = 2;  pre_code[3] = 0;
   pre_mask = 0x03;
 
   // --- BASIC VARIATION (SW5) on PH1, PA2-3 --------------------------------

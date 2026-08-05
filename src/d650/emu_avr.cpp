@@ -59,10 +59,102 @@ static void write_nib(const uint8_t *pins, uint8_t v) {
   for (uint8_t i = 0; i < 4; ++i) digitalWrite(pins[i], (v >> i) & 1 ? HIGH : LOW);
 }
 
+// ---------------------------------------------------------------------------
+// Panel-lamp de-noise on PE0 / PE1
+// ---------------------------------------------------------------------------
+// Those two lines are triple-purpose (see the lamp note in engine.h): they are
+// µPD444C address A8/A9, they are the CP and RS instrument-data bits, and they
+// are the ONLY two lines reaching the BASIC VARIATION and 1ST/2ND PART lamp
+// drivers. What turns that traffic back into a steady lamp on the real machine
+// is not the CPU, it is R9/C5 and R10/C4 integrating the line over ~100 ms.
+//
+// Mirroring the latch bit-for-bit hands the panel the raw traffic and leans on
+// those capacitors to sort it out, and they do not quite manage it here: the
+// emulated machine's RAM bursts are periodic (one per sequencer step), so the
+// average dips in step time and the OTHER lamp of the pair — the A lamp with
+// BASIC VARIATION on B — visibly flickers along with it.
+//
+// So do the integrating here, where the answer can be a hard decision instead
+// of an analog average sitting near a transistor's threshold:
+//
+//   - only intervals with NO RAM access in them are integrated. During an
+//     access the line is an address and carries no lamp information at all;
+//     excluding those is most of the win, and it is exactly the distinction the
+//     host already tracks for its own RAM decode (/CE, d650_host.h).
+//   - the decision has hysteresis, so a line hovering near the balance point
+//     settles instead of chattering.
+//   - the COMMON TRIG window passes RAW, so CP and RS still fire on the same
+//     data the CPU put up. The pending raw value is flushed to the pins at the
+//     trigger's rising edge, ahead of PI2, so the voice gate sees it inside
+//     IC6's stretched ~1 ms output exactly as before.
+//   - if no clean interval turns up for LAMP_STALE_MS the filter stands down
+//     and the mirror goes back to raw, so a program that never lets go of the
+//     bus is no worse off than before this existed.
+//
+// PE2/PE3 are untouched: they are HT/MT data and the RAM chip select, and they
+// drive no lamp.
+static const uint16_t LAMP_TRIG_HOLD_US = 1500;   // data window, as in engine.h
+static const int16_t  LAMP_ACC_US       = 4000;   // evidence clamp, +/- 4 ms
+static const int16_t  LAMP_HYST_US      = 2000;   // decision threshold
+static const uint16_t LAMP_STALE_MS     = 1000;   // no clean interval: stand down
+
+static uint8_t  s_pe_raw    = 0;      // last PORTE latch the CPU wrote
+static uint8_t  s_lamp      = 0;      // decided PE0/PE1
+static bool     s_lamp_ok   = false;  // a decision exists (else mirror raw)
+static int16_t  s_lamp_acc[2] = { 0, 0 };
+static uint32_t s_lamp_us   = 0;      // last lamp_service() timestamp
+static uint32_t s_lamp_ok_ms = 0;     // last clean interval
+static bool     s_ce_seen   = false;  // a RAM access happened in this interval
+static bool     s_trig_on   = false;  // inside the COMMON TRIG data window
+static uint32_t s_trig_us   = 0;
+
+static void write_pe() {
+  uint8_t v = s_pe_raw;
+  if (!s_trig_on && s_lamp_ok) v = (uint8_t)((v & 0x0C) | s_lamp);
+  write_nib(PE_PINS, v);
+}
+
+static void lamp_service(uint32_t now) {
+  const uint32_t gap = now - s_lamp_us;
+  s_lamp_us = now;
+
+  if (s_trig_on && (uint32_t)(now - s_trig_us) >= LAMP_TRIG_HOLD_US) {
+    s_trig_on = false;
+    write_pe();                       // data window over: lamps get the lines back
+  }
+
+  const bool clean = !s_ce_seen && !s_trig_on;
+  s_ce_seen = false;
+  if (!clean) {
+    if (s_lamp_ok && (uint32_t)(millis() - s_lamp_ok_ms) >= LAMP_STALE_MS) {
+      s_lamp_ok = false;              // nothing clean to go on: back to raw
+      write_pe();
+    }
+    return;
+  }
+  s_lamp_ok_ms = millis();
+
+  const int16_t w = (int16_t)(gap > 1000 ? 1000 : gap);
+  uint8_t next = s_lamp;
+  for (uint8_t i = 0; i < 2; ++i) {
+    int16_t a = (int16_t)(s_lamp_acc[i] + (((s_pe_raw >> i) & 1) ? w : (int16_t)-w));
+    if (a >  LAMP_ACC_US) a =  LAMP_ACC_US;
+    if (a < -LAMP_ACC_US) a = -LAMP_ACC_US;
+    s_lamp_acc[i] = a;
+    if (a >=  LAMP_HYST_US) next |= (uint8_t)(1 << i);
+    if (a <= -LAMP_HYST_US) next &= (uint8_t)~(1 << i);
+  }
+  if (!s_lamp_ok || next != s_lamp) {
+    s_lamp    = next;
+    s_lamp_ok = true;
+    write_pe();
+  }
+}
+
 static void hook_port(void *, int port, uint8_t v) {
   switch (port) {
     case UCOM4_PORTD: write_nib(PD_PINS, v); break;
-    case UCOM4_PORTE: write_nib(PE_PINS, v); break;
+    case UCOM4_PORTE: s_pe_raw = v; write_pe(); break;
     case UCOM4_PORTF: write_nib(PF_PINS, v); break;
     // PORTC is the µPD444C data bus and is deliberately NOT mirrored. The RAM is
     // emulated in SRAM; the physical chips are still fitted and drive that bus,
@@ -78,10 +170,20 @@ static void hook_port(void *, int port, uint8_t v) {
       s_ph = (uint8_t)(v & 0x0F);
       PORTF = (uint8_t)((s_pg << 4) | s_ph);
       break;
-    case UCOM4_PORTI:
-      digitalWrite(PI1_PIN, (v >> 1) & 1 ? HIGH : LOW);   // RAM CE
-      digitalWrite(PI2_PIN, (v >> 2) & 1 ? HIGH : LOW);   // COMMON TRIG
+    case UCOM4_PORTI: {
+      const bool ce   = ((v >> 1) & 1) != 0;              // RAM CE
+      const bool trig = ((v >> 2) & 1) != 0;              // COMMON TRIG
+      if (ce) s_ce_seen = true;                           // this interval is dirty
+      digitalWrite(PI1_PIN, ce ? HIGH : LOW);
+      if (trig) {
+        // Instrument data on the pins BEFORE the trigger edge: the lamp filter
+        // may be holding PE0/PE1 (CP and RS) at a lamp level.
+        s_trig_us = micros();
+        if (!s_trig_on) { s_trig_on = true; write_pe(); }
+      }
+      digitalWrite(PI2_PIN, trig ? HIGH : LOW);
       break;
+    }
     default: break;
   }
 }
@@ -223,6 +325,47 @@ static bool     s_pm_taken = false;  // one sample per dwell, or the shift
                                      // register fills with duplicates and the
                                      // debounce stops debouncing
 
+// ---------------------------------------------------------------------------
+// CLEAR key: a double-press goes back to SuperOS
+// ---------------------------------------------------------------------------
+// Nothing else on the panel can leave the emulator. The stock program has no
+// config menu and the µPD650C-085 has no idea a second firmware exists, so
+// before this the only ways out were SysEx 0x4D and the STEP 1 + STEP 16
+// power-on escape. This is the mirror of the config menu's step 9 going the
+// other way, on the same gesture SuperOS uses to open its menu.
+//
+// THE KEY IS WITHHELD FROM THE EMULATED CPU UNTIL THE GESTURE RESOLVES. Stock
+// CLEAR is destructive — PATTERN CLEAR erases the selected pattern, COMPOSE
+// erases the rhythm track, the write modes commit PRE SCALE — so handing the
+// CPU the first press and switching on the second would wipe a pattern on the
+// way out the door. Instead:
+//
+//   - a press held past the window PASSES THROUGH, so holding CLEAR (the STEP
+//     NUMBER chord, and everything else that wants it down) still works, just
+//     EMU_CLR_DTAP_MS late;
+//   - a short press with no second one is REPLAYED to the CPU as a clean press,
+//     so a stock CLEAR tap still lands, deferred by the same window;
+//   - a second press inside the window reboots into SuperOS, and the CPU never
+//     saw either press.
+//
+// The replay is fed as a level for EMU_CLR_REPLAY_MS. The CPU samples its
+// matrix on the 1.9 ms /INT cadence and debounces on top of that, so the press
+// has to outlast both; 120 ms is a comfortable multiple and still well short of
+// anything the program would read as a hold.
+static const uint16_t EMU_CLR_DTAP_MS   = 600;   // matches the SuperOS gesture
+static const uint16_t EMU_CLR_REPLAY_MS = 120;
+
+enum : uint8_t { CLR_IDLE = 0, CLR_PEND, CLR_WAIT, CLR_REPLAY, CLR_THRU };
+static uint8_t  s_clr_st   = CLR_IDLE;
+static uint32_t s_clr_ms   = 0;
+static uint8_t  s_clr_real = 0;   // debounced physical level
+static uint8_t  s_clr_cpu  = 0;   // level the emulated CPU is given
+
+// Where CLEAR sits in the snapshot: PH0 column, PA bit clear_bit (controls.h).
+static inline uint8_t clr_slot() {
+  return (uint8_t)(16 + (g_panel_map.clear_bit & 3));
+}
+
 static void commit_snapshot() {
   for (uint8_t i = 0; i < D650_IN_COUNT; ++i) {
     if (i == D650_IN_CLOCK) continue;      // served live by emu_read_clock
@@ -233,6 +376,16 @@ static void commit_snapshot() {
   // A MIDI Start/Continue runs the machine even with the panel flip-flop idle:
   // the CPU reads RUN as a level, so the transport simply ORs into it.
   if (s_midi_run) H.in[D650_IN_RUN] = 1;
+  // CLEAR is gated: debounce the physical level into s_clr_real for the gesture
+  // machine, and hand the CPU whatever that decides. Debounced straight off
+  // s_db rather than read back out of H.in — H.in[ci] holds the GATED level, and
+  // the loop above leaves an entry alone while its shift register is mixed, so
+  // reading it back would feed the gate its own output through every bounce.
+  const uint8_t ci = clr_slot();
+  const uint8_t cv = (uint8_t)(s_db[ci] & 0x07);
+  if (cv == 0x07)      s_clr_real = 1;
+  else if (cv == 0x00) s_clr_real = 0;
+  H.in[ci] = s_clr_cpu;
 }
 
 static void poll_matrix(uint32_t now_us) {
@@ -320,6 +473,63 @@ static void patt_service() {
   if (s_save_off >= D650_EXT_BYTES) s_saving = false;
 }
 
+// Finish the store synchronously, for the one moment there is no next loop pass
+// to finish it in: the firmware switch. The chunked writer above can have up to
+// 400 ms of settle plus a partial pass outstanding, and the reboot would take
+// those edits with it. eeprom_update_block skips unchanged bytes, so this is
+// cheap on a store that is mostly already written.
+static void patt_flush() {
+  if (!s_saving && !d650_dirty(&H)) return;
+  d650_clear_dirty(&H);
+  for (uint16_t i = 0; i < D650_EXT_BYTES; i += 64) {
+    d650_st_write_block(H.ext + i, EE_EMU_PATT + i, 64);
+    wdt_reset();
+  }
+  s_saving = false;
+}
+
+// The CLEAR gesture machine described above commit_snapshot(). Called once per
+// loop pass; s_clr_real is refreshed by every snapshot commit.
+static void clear_gesture(uint32_t now) {
+  switch (s_clr_st) {
+    case CLR_IDLE:
+      s_clr_cpu = 0;
+      if (s_clr_real) { s_clr_st = CLR_PEND; s_clr_ms = now; }
+      break;
+
+    case CLR_PEND:                          // down, still deciding what it is
+      s_clr_cpu = 0;
+      if (!s_clr_real) { s_clr_st = CLR_WAIT; s_clr_ms = now; }
+      else if ((uint32_t)(now - s_clr_ms) >= EMU_CLR_DTAP_MS) s_clr_st = CLR_THRU;
+      break;
+
+    case CLR_WAIT:                          // one short press banked
+      s_clr_cpu = 0;
+      if (s_clr_real) {
+        patt_flush();
+        combined_switch_firmware(FW_SUPEROS);          // does not return
+      } else if ((uint32_t)(now - s_clr_ms) >= EMU_CLR_DTAP_MS) {
+        s_clr_st = CLR_REPLAY; s_clr_ms = now;
+      }
+      break;
+
+    case CLR_REPLAY:                        // hand the CPU the press it missed
+      s_clr_cpu = 1;
+      if ((uint32_t)(now - s_clr_ms) >= EMU_CLR_REPLAY_MS) {
+        s_clr_cpu = 0;
+        s_clr_st  = CLR_IDLE;               // resyncs on the next pass if held
+      }
+      break;
+
+    case CLR_THRU:                          // held: the CPU gets it live
+      s_clr_cpu = s_clr_real;
+      if (!s_clr_real) s_clr_st = CLR_IDLE;
+      break;
+
+    default: s_clr_st = CLR_IDLE; break;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // MIDI: firmware switch and program-image upload
 // ---------------------------------------------------------------------------
@@ -369,7 +579,10 @@ static void midi_poll() {
         else s_sx_state = 4;                      // some other command: skip
         break;
       case 3:
-        if (b <= 1) combined_switch_firmware(b);  // does not return
+        if (b <= 1) {
+          patt_flush();
+          combined_switch_firmware(b);            // does not return
+        }
         s_sx_state = 4;
         break;
       default: if (b == 0xF7) s_sx_state = 0; break;
@@ -445,6 +658,11 @@ void emu_loop() {
   clock_sample(now);
   clock_service(now);
 
+  // Panel lamps: integrate the interval that just ended before the next batch
+  // dirties it. Also between batches, so "no RAM access in this interval" is a
+  // property of a whole batch rather than of a point inside one.
+  lamp_service(now);
+
   // Let the interpreter run. The batch is sized so the loop still services
   // /INT on time: at 16 MHz a ucom4 machine cycle is ~10 us of emulated time,
   // and this budget lands well inside the half-period above.
@@ -456,6 +674,8 @@ void emu_loop() {
   // taken by clock_sample THIS pass. Handing it the stale `now` would make that
   // subtraction wrap and the check would never hold.
   poll_matrix(micros());
+
+  clear_gesture(millis());   // CLEAR double-press -> back to SuperOS
 
   midi_poll();
   patt_service();

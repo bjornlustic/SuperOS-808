@@ -463,7 +463,7 @@ static void rx_byte(Engine &eng, uint8_t b, MidiClockIn &mc) {
   } else if (type == 0xC0) {                          // Program Change
     const uint8_t slot = (uint8_t)(s_ch_buf[0] & 15);
     // Bank Select LSB picks the variation the panel switch would otherwise set.
-    if (s_bank_lsb <= 1) eng.variation = s_bank_lsb ? VAR_B : VAR_A;
+    if (s_bank_lsb <= 1) eng.SetVariation(s_bank_lsb ? VAR_B : VAR_A);
     eng.SelectSlot(slot);
   }
 }

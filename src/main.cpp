@@ -126,46 +126,49 @@ static uint16_t frame        = 0;  // step-LED frame shown by ScanAndDisplay
 // A tap can only be recognised on RELEASE, so the stock tap action fires on
 // release. The one stock behaviour needing press-time response is chase-delete,
 // which is a hold anyway and starts once HOLD_MS passes.
-// A tap is DEFERRED until the double-tap window closes. Without that, the first
-// press of a double-tap fires the single-tap action on its way to the menu —
-// which in a write mode means committing the PRE SCALE dial into the pattern.
-// Opening the config menu would silently change the pattern's step timing to
-// wherever the dial happened to be resting. Measured on hardware: a pattern at
-// 4 steps/beat jumped to 8 because the dial sat at position 4.
 //
-// The double-tap window is measured from the first RELEASE to the second PRESS,
-// so it is a gap, not a budget the second press has to fit inside as well. The
-// old form timed release-to-release, which meant the gap plus the whole second
-// press had to land inside 350 ms — tight enough that an ordinary double-tap
-// read as two singles and the menu never opened.
+// THE GESTURE IS A PRESS BURST, NOT A PAIR OF INDEPENDENT TAPS. Short presses
+// accumulate in `presses` and the burst is only dispatched once it closes, so a
+// single tap is DEFERRED by CLEAR_DTAP_MS. Without that, the first press of a
+// double-tap fires the single-tap action on its way to the menu — which in a
+// write mode means committing the PRE SCALE dial into the pattern. Opening the
+// config menu would silently change the pattern's step timing to wherever the
+// dial happened to be resting. Measured on hardware: a pattern at 4 steps/beat
+// jumped to 8 because the dial sat at position 4.
+//
+// The earlier form tracked one pending tap plus an "armed" flag and rebuilt the
+// pair from scratch on every press, which left a hole: any double-press the
+// window did not quite catch degenerated back into TWO single taps, and in a
+// write mode both of them re-stamped the resting PRE SCALE dial. Counting the
+// burst closes that — a second press cannot resurrect the first one's tap,
+// whatever the timing — and the count is also why a triple-press is a menu
+// toggle rather than a menu toggle plus a stray stock action.
+//
+// The window is measured from the last RELEASE to the next PRESS, so it is a
+// gap, not a budget the second press has to fit inside as well. An earlier form
+// timed release-to-release, which meant the gap plus the whole second press had
+// to land inside the window and an ordinary double-tap read as two singles.
 static const uint16_t CLEAR_TAP_MS  = 350;
 static const uint16_t CLEAR_HOLD_MS = 350;
-static const uint16_t CLEAR_DTAP_MS = 500;
+static const uint16_t CLEAR_DTAP_MS = 600;
 static const uint16_t CLEAR_LONG_MS = 2000;
 
 struct ClearGesture {
   uint32_t down_ms   = 0;
   uint32_t last_up   = 0;
+  uint8_t  presses   = 0;       // short presses banked in the current burst
   bool     chorded   = false;
   bool     consumed  = false;
   bool     hold_seen = false;
   bool     long_seen = false;
   bool     tap       = false;
   bool     dtap      = false;
-  bool     pend_tap  = false;   // a tap waiting out the double-tap window
-  bool     dtap_arm  = false;   // second press seen; its release is the dtap
 
   void update(const PinState &b, uint32_t now) {
     tap = dtap = false;
     if (b.rising()) {
       down_ms = now; chorded = false; consumed = false;
       hold_seen = false; long_seen = false;
-      // Second press inside the window: this is a double-tap. The first tap is
-      // cancelled before it ever fired.
-      if (pend_tap && (uint32_t)(now - last_up) < CLEAR_DTAP_MS) {
-        pend_tap = false;
-        dtap_arm = true;
-      }
     }
     if (b.held()) {
       const uint32_t dt = now - down_ms;
@@ -175,20 +178,21 @@ struct ClearGesture {
     if (b.falling()) {
       const uint32_t dt = now - down_ms;
       if (dt < CLEAR_TAP_MS && !chorded && !consumed) {
-        if (dtap_arm) { dtap = true; dtap_arm = false; pend_tap = false; }
-        else          { pend_tap = true; last_up = now; }
+        last_up = now;
+        // Two banked presses ARE the double-tap; fire it on this release rather
+        // than waiting the window out, so the menu still opens the instant the
+        // gesture is complete. Only the single tap has to be deferred.
+        if (++presses >= 2) { dtap = true; presses = 0; }
       } else {
-        // A hold, a chord, or a consumed press ends the sequence outright, so a
+        // A hold, a chord, or a consumed press ends the burst outright, so a
         // tap-then-hold cannot leave a stale tap queued behind the tool map.
-        pend_tap = false; dtap_arm = false;
+        presses = 0;
       }
     }
-    // A single tap fires once the double-tap window has closed with no second
-    // press. Costs CLEAR_DTAP_MS of latency on stock CLEAR actions, which is the
-    // price of never firing one by accident on the way into the menu.
-    if (pend_tap && !b.held() && (uint32_t)(now - last_up) >= CLEAR_DTAP_MS) {
+    // The burst closed with one press banked: that is a single tap.
+    if (presses && !b.held() && (uint32_t)(now - last_up) >= CLEAR_DTAP_MS) {
       tap = true;
-      pend_tap = false;
+      presses = 0;
     }
   }
   bool map_open() const { return hold_seen; }
@@ -213,6 +217,11 @@ static uint8_t  s_pre_ref     = 0xFF;
 static uint8_t  s_prob_sel    = 0xFF;
 static uint8_t  s_ratchet_sel = 0xFF;
 static uint32_t s_clear_up_ms = 0;
+
+// PRE SCALE dial value as of the last commit, 0xFF before the first scan. A
+// bare CLEAR tap only stamps the dial into the pattern when it has MOVED since
+// then — see the commit site at the bottom of loop().
+static uint8_t  s_pre_committed = 0xFF;
 
 #ifdef SUPEROS_COMBINED
 static constexpr uint8_t EMU_STEP = 8;   // menu step 9: reboot into the emulator
@@ -389,7 +398,7 @@ void setup() {
   load_all(eng);
   load_settings(g_settings);
 
-  eng.SetIndicators(varVal, false);
+  eng.SetIndicators(eng.live_variation(), false);
 
   // Pin-change interrupt on all four PA status inputs (AVR PB0-3). The ISR
   // filters down to the calibrated clock line, so recalibrating the map does not
@@ -432,6 +441,7 @@ static void handle_pattern_write(uint8_t inst) {
       clr.chorded = true;
       eng.SetSectionLength(disp_section, (uint8_t)(b + 1));
       eng.CommitPrescale(preVal);
+      s_pre_committed = preVal;    // the dial is now what the pattern holds
       midi_send_layout_update(eng.cur_pat);
     }
     return;                       // CLEAR held: no step editing this pass
@@ -545,8 +555,15 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
         }
       break;
     case TOOL_PRESCALE:
+      // Steps 1-4 set the PRE SCALE outright; the LED frame shows which one the
+      // pattern holds. Marking the dial as committed keeps a later CLEAR tap
+      // from undoing this with whatever detent the dial is resting on.
       for (uint8_t b = 0; b < 4; ++b)
-        if (stepB[b].rising()) { eng.CommitPrescale(b); midi_send_layout_update(eng.cur_pat); }
+        if (stepB[b].rising()) {
+          eng.CommitPrescale(b);
+          s_pre_committed = preVal;
+          midi_send_layout_update(eng.cur_pat);
+        }
       break;
     case TOOL_COPY:
       if (stepB[0].rising()) eng.CopyPatternToBuf();
@@ -641,6 +658,15 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
   if (s_pre_ref != 0xFF && preVal != s_pre_ref) {
     s_pre_ref = preVal;
     if (tool == TOOL_SECTION) disp_section = preVal;
+    // The PRESCALE tool also follows the dial, so it doubles as the live
+    // readout of the PRE SCALE decode: turn to detent n and step LED n lights.
+    // That is the check to run against docs/HARDWARE_MAP.md if the dial ever
+    // looks rotated again (see PanelMap::pre_code).
+    if (tool == TOOL_PRESCALE) {
+      eng.CommitPrescale(preVal);
+      s_pre_committed = preVal;
+      midi_send_layout_update(eng.cur_pat);
+    }
   }
 }
 
@@ -663,12 +689,25 @@ static void handle_config_menu() {
   }
   if (stepB[6].rising() && !eng.running) eng.ApplyMasterPoly(!eng.master_poly);
   if (stepB[7].rising()) midi_start_panel_calibration();
+#ifdef SUPEROS_COMBINED
+  // Step 9 boots the emulator, right now — the same thing SysEx 0x4D does, and
+  // no more ceremony than the editor's button. There used to be a long-press
+  // confirm on top (and before that, a confirm with no way to arm it, so step 9
+  // did nothing at all). The confirm was guarding against an accidental one-way
+  // trip; it is not one-way any more, because the emulator answers a CLEAR
+  // double-press by coming back here (see emu_avr.cpp).
+  if (stepB[EMU_STEP].rising()) {
+    save_dirty(eng);
+    combined_switch_firmware(FW_D650);        // does not return
+  }
+#endif
   if (stepB[15].rising()) { s_menu = false; s_menu_hold = true; }
 }
 
 // ---------------------------------------------------------------------------
 // LED frames
 // ---------------------------------------------------------------------------
+
 static uint16_t build_frame(uint8_t mode, uint8_t inst) {
   uint16_t f = 0;
 
@@ -706,13 +745,15 @@ static uint16_t build_frame(uint8_t mode, uint8_t inst) {
   }
 
   // PATTERN WRITE. Show the shown part's steps for the selected instrument, with
-  // the playhead inverted. Steps past this part's length stay dark.
+  // the playhead inverted for the first tempo-clock tick of its step — the stock
+  // machine's chase flash, measured off the program image (Engine::chase_lit).
+  // Steps past this part's length stay dark.
   const uint8_t plen = eng.SectionLength(disp_section);
   for (uint8_t b = 0; b < plen && b < NUM_STEP_BTNS; ++b) {
     const uint8_t s = (uint8_t)(disp_section * NUM_STEP_BTNS + b);
     if (eng.cur().step_get(inst, s)) f |= led_bit(b);
   }
-  if (eng.running) {
+  if (eng.chase_lit()) {
     const uint8_t ph = eng.inst_playhead(inst);
     if (ph != 0xFF && (ph >> 4) == disp_section) f ^= led_bit((uint8_t)(ph & 15));
   }
@@ -837,7 +878,11 @@ void loop() {
   const uint8_t mode = modeVal;
   const uint8_t inst = instVal % NUM_INSTRUMENTS;
 
-  eng.variation  = varVal;
+  // First scan: adopt whatever detent PRE SCALE is resting on as the committed
+  // reference, so power-on is not itself read as "the operator turned the dial".
+  if (s_pre_committed == 0xFF) s_pre_committed = preVal;
+
+  eng.SetVariation(varVal);
   eng.fill_every = fillVal;
   eng.if_var_b   = panel.if_variation_b();
   if (pedalFillB.rising()) eng.TapFill();   // the rear FILL IN pedal
@@ -939,15 +984,7 @@ void loop() {
   if (s_menu_hold && !clearB.held()) s_menu_hold = false;
 
   if (s_menu || s_menu_hold) {
-    if (s_menu) {
-#ifdef SUPEROS_COMBINED
-      if (stepB[EMU_STEP].rising() && clr.long_seen) {   // long-press to confirm
-        save_dirty(eng);
-        combined_switch_firmware(FW_D650);               // does not return
-      }
-#endif
-      handle_config_menu();
-    }
+    if (s_menu) handle_config_menu();
     midi_tx_service(eng);
     if (midi_take_save_request(eng))  save_dirty(eng);
     if (midi_take_settings_save(eng)) save_settings(g_settings);
@@ -1002,10 +1039,22 @@ void loop() {
 
   // A CLEAR tap in a write mode with no tool latched commits the PRE SCALE dial
   // into the pattern — the stock behaviour from OM p.13.
+  //
+  // ONLY IF THE DIAL HAS MOVED since the last commit, which is the same rule the
+  // tools already follow (see s_pre_ref in handle_tool): react to a CHANGE the
+  // operator made, never to wherever the dial happens to be resting. The stock
+  // procedure is "set PRE SCALE, then press CLEAR", so a deliberate commit
+  // always passes; what it stops is every OTHER CLEAR tap silently restamping
+  // the resting detent over a pattern that was written at a different one.
+  // That is what turned a mistimed double-press — one the burst counter did not
+  // read as a menu gesture — into a pattern whose step timing had changed.
   if (clr.tap && tools_ok && s_tool == TOOL_NONE) {
     clr.tap = false;
-    eng.CommitPrescale(preVal);
-    midi_send_layout_update(eng.cur_pat);
+    if (preVal != s_pre_committed) {
+      s_pre_committed = preVal;
+      eng.CommitPrescale(preVal);
+      midi_send_layout_update(eng.cur_pat);
+    }
   }
 
   // The arp is momentary, not a latch: leaving the ARP tool clears it so the
@@ -1022,16 +1071,25 @@ void loop() {
   if (midi_take_panelmap_save(eng)) save_panel_map(g_panel_map);
 
   // 8. Panel indicator LEDs + next display frame.
-  // The 1ST/2ND PART lamp follows the section actually being EDITED, not just
-  // the MODE dial: the SECTION tool moves the display without touching the dial,
-  // and sections 3/4 are the second parts of the extended halves. Outside the
-  // write modes there is no edited section, so the dial is all there is.
   //
-  // It doubles as the one panel-only test that separates a dead lamp from a
-  // mis-decoded MODE knob — the SECTION tool can light the 2ND PART lamp with
-  // the dial untouched.
-  const bool part2_lamp = mode_is_write(mode) ? ((disp_section & 1) != 0)
-                                              : (mode == MODE_2ND_PART);
+  // WHILE RUNNING the 1ST/2ND PART lamp follows the section being PLAYED, like
+  // the stock machine's: a measure is the sections concatenated, so the lamp
+  // flips as playback crosses from the 1st PART into the 2nd. Sections 0 and 2
+  // are 1st PARTs, 1 and 3 are 2nd PARTs, hence (section & 1). Driving it from
+  // the MODE dial instead lit 2ND PART the moment the dial moved, a whole part
+  // — or a whole measure — before that part was audible.
+  //
+  // STOPPED there is nothing playing, so it shows the section being EDITED
+  // rather than just the dial: the SECTION tool moves the display without
+  // touching the dial, and sections 3/4 are the second parts of the extended
+  // halves. That is also the one panel-only test separating a dead lamp from a
+  // mis-decoded MODE knob — with the machine stopped, the SECTION tool can
+  // light the 2ND PART lamp with the dial untouched.
+  const uint8_t play_sec = eng.playing_section();
+  const bool part2_lamp =
+      (play_sec != 0xFF) ? ((play_sec & 1) != 0)
+                         : (mode_is_write(mode) ? ((disp_section & 1) != 0)
+                                                : (mode == MODE_2ND_PART));
   eng.SetIndicators(eng.live_variation(), part2_lamp);
   if (tools_ok && clr.map_open() && clearB.held()) frame = build_map_frame();
   else if (tools_ok && s_tool != TOOL_NONE)        frame = build_tool_frame(s_tool, inst);

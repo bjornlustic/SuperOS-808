@@ -72,9 +72,12 @@ python3 tools/d650/make_image_embed.py <your-transfer.syx>
 
 The generated header is gitignored and must not be committed or redistributed.
 
-Switch firmwares from the config menu (double-tap CLEAR, step 9, long-press CLEAR to confirm),
-by SysEx `F0 7D 4D <0|1> F7`, or — as a recovery path — by holding **STEP 1 + STEP 16** at
-power-on, which forces SuperOS regardless of the stored selection.
+Switch into the emulator from the config menu (double-tap CLEAR, then step 9), and back out
+of it by **double-pressing CLEAR** — the emulated machine has no menu of its own, so that
+gesture belongs to the bridge, which keeps the key from reaching the emulated CPU until it
+knows whether it was one press or two. Either direction is also SysEx `F0 7D 4D <0|1> F7`,
+and holding **STEP 1 + STEP 16** at power-on forces SuperOS regardless of the stored
+selection.
 
 ## Building
 

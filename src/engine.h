@@ -231,11 +231,53 @@ class Engine {
     digitalWrite(LAMP_VAR_PIN,  var_showing == VAR_B ? HIGH : LOW);
     digitalWrite(LAMP_PART_PIN, part2 ? HIGH : LOW);
   }
-  // Which variation is sounding right now (what the panel LEDs should show).
-  uint8_t live_variation() const {
-    if (fill_now_) return if_var_b ? VAR_B : VAR_A;
-    if (variation == VAR_AB) return ab_phase_ ? VAR_B : VAR_A;
-    return variation;
+  // Which variation is SOUNDING right now — which is not the dial.
+  //
+  // Taken from cur_pat rather than from `variation`, because cur_pat is what
+  // resolve_pattern_() re-derives at the measure boundary: a variation change
+  // takes effect "on the first beat of the following measure" (OM p.12), and a
+  // lamp driven from the switch lights up to a measure before the B pattern is
+  // audible. Reading the pattern actually addressed also covers AB alternation
+  // and an intro/fill measure (which follows I/F VARIATION, not BASIC) for
+  // free, since resolve_pattern_() already handles both.
+  uint8_t live_variation() const { return pat_var(cur_pat) ? VAR_B : VAR_A; }
+
+  // The 16-step section sounding right now, 0xFF when stopped. Sections 0/2 are
+  // 1st PARTs and 1/3 are 2nd PARTs, so the panel's 1ST/2ND PART lamp is
+  // (section & 1) while running — it shows the part being PLAYED, the way the
+  // stock machine's does, rather than the part the MODE dial is pointing at.
+  uint8_t playing_section() const {
+    return (running && step >= 0) ? (uint8_t)((uint8_t)step >> 4) : 0xFF;
+  }
+
+  // True while the chase light belongs on the playhead's step: the FIRST
+  // tempo-clock tick of the step, and no longer. tick_ is 1 for exactly that
+  // span (ClockTick sets it on the boundary and counts up from there).
+  //
+  // MEASURED OFF THE STOCK PROGRAM IMAGE, not chosen — tools/d650/chase_probe.c
+  // runs the µPD650C-085 program against this same emulator core on a desktop
+  // and watches the step-LED drive. The playhead LED comes on for one 24-PPQN
+  // tick at the top of each step and then goes dark for the rest of it.
+  //
+  // Which is a different thing from a blink rate, and the two look identical
+  // until you make the clock irregular. Under a deliberately jittered clock
+  // (tick periods cycling 53 / 83 / 113 ms while the step stayed at 666 ms) the
+  // flash followed the individual TICK, spread 68 ms. A blink at a fixed rate,
+  // or a fixed fraction of the step, would both have sat at ~83 ms.
+  //
+  // So the duty falls out of PRE SCALE instead of being a free parameter:
+  // 1/8 of the step at PRE SCALE 1 (8 ticks per step), 1/4 at 2, 1/6 at 3,
+  // 1/3 at 4. The flash is a constant musical length at any tempo.
+  bool chase_lit() const { return running && step >= 0 && tick_ == 1; }
+
+  // BASIC VARIATION dial. While running a change only arms: on_wrap() calls
+  // resolve_pattern_() at the measure boundary, which is where OM p.12 puts it.
+  // Stopped, it applies immediately — that is what makes the dial choose which
+  // memory the write modes edit, and it keeps the lamp honest either way.
+  void SetVariation(uint8_t v) {
+    if (v == variation) return;
+    variation = v;
+    if (!running) { resolve_pattern_(); latch_prescale(); }
   }
 
   // ---- pattern cache --------------------------------------------------------
