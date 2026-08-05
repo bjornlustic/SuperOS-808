@@ -246,7 +246,10 @@ static bool     s_in_sysex = false;
 static uint8_t s_run_status = 0;
 static uint8_t s_ch_buf[2];
 static uint8_t s_ch_n = 0;
-static uint8_t s_bank_lsb = 0;
+// 0xFF until a Bank Select LSB actually arrives, so "no bank select sent" is
+// distinguishable from "bank 0" and the program number can pick the variation
+// on its own. It used to default to 0, which read as a standing "variation A".
+static uint8_t s_bank_lsb = 0xFF;
 
 static bool s_transport_latch = false;
 void midi_transport_clear() { s_transport_latch = false; }
@@ -461,10 +464,16 @@ static void rx_byte(Engine &eng, uint8_t b, MidiClockIn &mc) {
   } else if (type == 0xB0) {                          // Control Change
     if (s_ch_buf[0] == 32) s_bank_lsb = s_ch_buf[1];  // Bank Select LSB = variation
   } else if (type == 0xC0) {                          // Program Change
-    const uint8_t slot = (uint8_t)(s_ch_buf[0] & 15);
-    // Bank Select LSB picks the variation the panel switch would otherwise set.
-    if (s_bank_lsb <= 1) eng.SetVariation(s_bank_lsb ? VAR_B : VAR_A);
-    eng.SelectSlot(slot);
+    // All 32 patterns from Program Change alone: PC 0-15 = variation A slots
+    // 1-16, PC 16-31 = variation B. Bank Select LSB still picks the variation
+    // for hosts that send it and takes precedence, but it is awkward to send
+    // from a DAW arrangement and the low bit of the program number is not, so
+    // the second bank is reachable either way. Higher program numbers repeat
+    // the pair rather than being ignored.
+    const uint8_t pc  = (uint8_t)(s_ch_buf[0] & 0x7F);
+    const uint8_t var = (s_bank_lsb <= 1) ? s_bank_lsb : (uint8_t)((pc >> 4) & 1);
+    eng.SetVariation(var ? VAR_B : VAR_A);
+    eng.SelectSlot((uint8_t)(pc & 15));
   }
 }
 

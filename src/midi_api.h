@@ -52,9 +52,17 @@
 // a one-shot trigger pulse — this is how the editor auditions steps, and it
 // makes the 808 playable from a DAW or pads. Velocity >= 100 asserts accent.
 //
-// Pattern selection by MIDI Program Change: PC 0-15 selects the STEP button
-// slot (12 basic + 4 intro/fill); CC 32 (Bank Select LSB) picks variation
-// 0 = A, 1 = B. Selection behaves exactly like a panel press.
+// Pattern selection by MIDI Program Change. PC 0-15 = variation A slots 1-16,
+// PC 16-31 = variation B, so all 32 patterns are reachable from program
+// changes alone; higher numbers repeat the pair. CC 32 (Bank Select LSB) also
+// picks the variation (0 = A, 1 = B) and takes precedence once sent, for hosts
+// that send it. Slots 13-16 are the INTRO/FILL IN bank, so a program change
+// there arms the fill rather than switching the basic rhythm.
+//
+// Selection behaves exactly like a panel press, which means it is QUANTIZED:
+// while running the new pattern takes over at the end of the measure (or
+// immediately if the change lands on the downbeat), so a DAW firing program
+// changes on the bar line switches cleanly.
 //
 // MIDI channel (Settings.midi_channel): 0 = omni, 1..16 = that channel only;
 // gates Note On, Program Change and Bank Select. SysEx is channel-less.

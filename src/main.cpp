@@ -1025,7 +1025,14 @@ void loop() {
   // reference, so power-on is not itself read as "the operator turned the dial".
   if (s_pre_committed == 0xFF) s_pre_committed = preVal;
 
-  eng.SetVariation(varVal);
+  // The BASIC VARIATION dial owns the variation, but only when it MOVES.
+  // Asserting it on every pass meant anything else that set the variation —
+  // a Program Change from a DAW, the editor — was overwritten by the dial about
+  // a millisecond later, before it could reach the next measure boundary. Now
+  // the dial writes on a change and otherwise leaves the value alone, so the
+  // last deliberate setter wins and moving the dial still takes it back.
+  static uint8_t s_var_panel = 0xFF;
+  if (varVal != s_var_panel) { s_var_panel = varVal; eng.SetVariation(varVal); }
   eng.fill_every = fillVal;
   eng.if_var_b   = panel.if_variation_b();
   if (pedalFillB.rising()) eng.TapFill();   // the rear FILL IN pedal
