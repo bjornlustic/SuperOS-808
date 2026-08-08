@@ -36,6 +36,13 @@ presses fell between debounce samples, so slot selection and the CLEAR tap rarel
 registered. The slot-occupancy display is now served from a cached mask rebuilt only on
 mode entry, variation change, after a clear, and once a second while stopped.
 
+**Ratchet repeats were rushed at several PRE SCALE and count combinations.** Retriggers
+were scheduled on whole 24-PPQN ticks with truncating division, so a 4x ratchet on a
+six-tick sixteenth landed its hits on ticks 0/1/2/3: a fast burst and then silence, audibly
+out of time. Retriggers are now scheduled in microseconds from the measured tick period,
+spaced evenly across the step's real duration, under the internal clock, DIN sync and MIDI
+clock alike.
+
 **Config-menu settings did not survive a power cycle.** The menu edited the settings in RAM
 and nothing on the panel side ever wrote them to flash; only a save pushed from the web
 editor persisted them. Settings changed in the menu are now flushed to flash when the menu
@@ -53,12 +60,14 @@ the CPU for a few milliseconds).
   LENGTH moved to the Length tool (TAP + step), where the 606 keeps it.
 - **MUTE all / unmute all** on steps 15/16, and **COPY** gained clear-pattern on step 1,
   **TRANSFORM** gained randomize on step 4.
-- **Per-voice loop length on TAP in both length-minded tools.** In LENGTH and POLYMETER a
-  TAP enters a blinking voice-length phase: the next step press sets the selected voice's
-  own loop length (absolute across the sections), and a second TAP puts the voice back on
-  the pattern. Two earlier shapes died on hardware in one session: TAP + step as a held
-  chord is physically impossible (the TAP status line reads as a short pulse, so `held()`
-  drops while the button is still down), and the global length override's stint on
+- **Per-voice loop length on TAP in both length-minded tools.** In LENGTH and POLYMETER,
+  TAP toggles between two sticky modes: master (solid display; the tool's normal surface)
+  and voice length (display blinks at the beat; steps set the selected voice's own loop
+  length, absolute across the sections, and the step that already is the length clears
+  it). Three earlier shapes died on hardware in one session: TAP + step as a held chord is
+  physically impossible (the TAP status line reads as a short pulse, so `held()` drops
+  while the button is still down); an auto-exiting phase read as the tool randomly
+  alternating between master and voice length; and the global length override's stint on
   POLYMETER's TAP meant the natural polymeter gesture silently armed it. The global
   override lost its panel binding; the engine support remains for a future editor hook.
 - **Web editor: probability and ratchet are editable per step.** The editor round-tripped
