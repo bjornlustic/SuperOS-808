@@ -533,8 +533,8 @@ static void handle_compose(uint8_t inst) {
 // slots. Doing that inline in build_frame() every pass stretched the ~1 ms loop
 // to ~20 ms: the LED multiplex strobed visibly and most button presses fell
 // between debounce samples, so the mode read as dead. The mask is rebuilt only
-// when it can be stale — mode entry, variation change, after a clear, and once
-// a second while stopped (to track editor pushes) — never per pass.
+// when it can be stale (mode entry, variation change, after a clear, and once a
+// second while stopped, to track editor pushes) and never per pass.
 static uint16_t s_occ_mask = 0;
 static uint8_t  s_occ_var  = 0xFF;   // variation the mask was built for; 0xFF = stale
 static uint32_t s_occ_ms   = 0;
@@ -674,7 +674,7 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       }
       break;
     case TOOL_RATCHET:
-      // Same shape. Set: the key number is the TOTAL hit count — key 1 = a
+      // Same shape. Set: the key number is the TOTAL hit count: key 1 = a
       // single hit (which CLEARS the ratchet), 2/3/4 = 2x/3x/4x retrigger,
       // anything above also 4x (ratchet_set clamps). TAP also = single hit.
       // Key 1 used to mean 2x, so there was no key that put a step back to one
@@ -869,7 +869,7 @@ static uint16_t build_frame(uint8_t mode, uint8_t inst) {
 
   if (mode == MODE_PATTERN_CLEAR) {
     // Every slot holding data lights, so you can see what you are erasing; the
-    // selected one is inverted. Served from the occupancy cache — see
+    // selected one is inverted. Served from the occupancy cache; see
     // occ_rebuild for why this must never hit the store every pass. Rebuilds
     // only run while stopped: a ~20 ms rebuild under a running clock would
     // slip ticks, and clearing is a stopped operation anyway.
