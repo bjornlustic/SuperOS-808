@@ -569,46 +569,60 @@ static void handle_pattern_clear_mode() {
 // ---------------------------------------------------------------------------
 // Tool layer
 // ---------------------------------------------------------------------------
-// TAP inside a tool is both a chord modifier (TAP + step) and an action of its
-// own on release. This latches which one it was, the way the 606 does with
-// GROUP: set when a step is chorded, so the bare-tap action is suppressed.
-static bool s_tap_used = false;
+// TAP INSIDE A TOOL IS AN EDGE, NEVER A HELD MODIFIER. Measured on hardware:
+// the TAP status line reads as a short pulse, so tapB.held() drops within a
+// few samples of the press even while the button is physically down. Two
+// designs that chorded "hold TAP + step" both failed the same way on the
+// machine: the TAP-held LED display flashed once and the step press then fell
+// through to the bare-step action. Every TAP behaviour in the tool layer is
+// therefore phase-based, like PROBABILITY and RATCHET: a TAP toggles a phase,
+// the display blinks to show it, and the next step press acts in that phase.
+//
+// s_ilen_phase is the LENGTH / POLY tools' phase: set by a TAP, the next step
+// press writes the SELECTED VOICE's own loop length (absolute across the
+// sections), and a second TAP puts the voice back on the pattern. Cleared on
+// tool change.
+static bool s_ilen_phase = false;
 
 static void handle_tool(uint8_t tool, uint8_t inst) {
   const uint8_t sec = disp_section;
-  if (tapB.rising()) s_tap_used = false;
 
   switch (tool) {
     case TOOL_LENGTH:
       // Bare step = this section's step count, the stock STEP NUMBER value:
       // the master length every voice follows by default.
       //
-      // TAP + step = the SELECTED VOICE's own loop length (absolute across the
+      // TAP toggles the VOICE-LENGTH phase (the display blinks): the next step
+      // press sets the SELECTED VOICE's own loop length (absolute across the
       // sections: section n, key k = n*16 + k + 1), so one voice can run
-      // shorter or longer than the bar. A bare TAP puts that voice back to
-      // following the pattern. Whether the voice's loop free-runs against the
-      // bar or resets with it is that voice's switch in the POLY tool, whose
-      // TAP does the SAME thing as this one: the gesture means "this voice's
-      // own length" in either tool, because lengths are what both tools put
-      // on the operator's mind. The GLOBAL LENGTH override briefly sat on the
-      // POLY tool's TAP instead, and the first thing that happened on hardware
-      // is that TAP + voice-key there silently armed the override (a blinking
-      // LED, no poly change). It has no panel binding now; eng.global_len
-      // stays in the engine for a future editor hook.
-      for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
-        if (stepB[b].rising()) {
-          if (tapB.held()) {
-            s_tap_used = true;
+      // shorter or longer than the bar. A second TAP instead puts the voice
+      // back to following the pattern. Whether the voice's loop free-runs
+      // against the bar or resets with it is that voice's switch in the POLY
+      // tool, whose TAP phase is this same one. The GLOBAL LENGTH override
+      // has no panel binding (eng.global_len stays for a future editor hook):
+      // its stint on TAP meant the natural polymeter gesture silently armed
+      // it, and the hold-TAP chord that replaced it turned out to be
+      // impossible on the hardware (see s_ilen_phase above).
+      if (s_ilen_phase) {
+        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
+          if (stepB[b].rising()) {
             eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
             midi_send_pattern_dump(eng.cur_pat);
-          } else {
+            s_ilen_phase = false;
+            break;
+          }
+        if (tapB.rising()) {
+          eng.SetInstLength(inst, 0);          // this voice follows the pattern
+          midi_send_pattern_dump(eng.cur_pat);
+          s_ilen_phase = false;
+        }
+      } else {
+        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
+          if (stepB[b].rising()) {
             eng.SetSectionLength(sec, (uint8_t)(b + 1));
             midi_send_layout_update(eng.cur_pat);
           }
-        }
-      if (tapB.falling() && !s_tap_used) {
-        eng.SetInstLength(inst, 0);            // this voice follows the pattern
-        midi_send_pattern_dump(eng.cur_pat);
+        if (tapB.rising()) s_ilen_phase = true;
       }
       break;
     case TOOL_PRESCALE:
@@ -719,23 +733,24 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       // Both rewrite every pattern in the store, so they only fire while
       // stopped — the 606 puts them on CLEAR and TAP for the same reason.
       //
-      // TAP + step = the SELECTED VOICE's own loop length, identical to the
-      // Length tool's TAP, and a bare TAP puts the voice back on the pattern.
-      // "TAP + key = this voice's length" is the gesture an operator reaches
-      // for in THIS tool when setting up a polymeter, so it must mean the same
-      // thing here. Its brief stint as the global-override key meant the
-      // natural gesture silently armed the override (a blinking LED, no poly
-      // change); found on hardware within minutes of flashing.
-      // No early break out of the TAP branch: held() is still true on the pass
-      // that reports falling() (the debounce shift register reads 0b100 there),
-      // so bailing out here would mean the bare-TAP action below never runs.
-      if (tapB.held()) {
+      // TAP toggles the same VOICE-LENGTH phase as the Length tool's: the next
+      // step press sets the SELECTED VOICE's own loop length, a second TAP
+      // puts the voice back on the pattern. "TAP then a length" is the gesture
+      // an operator reaches for in THIS tool when setting up a polymeter, so
+      // it means the same thing in both places.
+      if (s_ilen_phase) {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
-            s_tap_used = true;
             eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
             midi_send_pattern_dump(eng.cur_pat);
+            s_ilen_phase = false;
+            break;
           }
+        if (tapB.rising()) {
+          eng.SetInstLength(inst, 0);          // this voice follows the pattern
+          midi_send_pattern_dump(eng.cur_pat);
+          s_ilen_phase = false;
+        }
       } else {
         for (uint8_t b = 0; b < NUM_INSTRUMENTS; ++b)
           if (stepB[b].rising()) {
@@ -747,10 +762,7 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
           save_dirty(eng);
           for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
         }
-      }
-      if (tapB.falling() && !s_tap_used) {
-        eng.SetInstLength(inst, 0);            // this voice follows the pattern
-        midi_send_pattern_dump(eng.cur_pat);
+        if (tapB.rising()) s_ilen_phase = true;
       }
       break;
     case TOOL_MUTE:
@@ -926,11 +938,18 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
   uint16_t f = 0;
   switch (tool) {
     case TOOL_LENGTH: {
-      // TAP held: the selected voice's own loop length, dark = follows the
-      // pattern. Otherwise this section's own step count, solid.
-      if (tapB.held()) {
-        const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
-        if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
+      // Voice-length phase: BLINK the selected voice's own loop length (or,
+      // when the voice has none, the section length it currently follows), so
+      // the blink itself says "the next step press is this voice's length".
+      // Normal phase: this section's own step count, solid.
+      if (s_ilen_phase) {
+        uint8_t L = eng.cur().ilen[inst % NUM_INSTRUMENTS];
+        if (!L) {
+          const uint8_t sl = eng.SectionLength(sec);
+          L = sl ? (uint8_t)(sec * NUM_STEP_BTNS + sl) : 0;
+        }
+        if (L && (uint8_t)((L - 1) >> 4) == sec && tempo_blink())
+          f = led_bit((uint8_t)((L - 1) & 15));
         break;
       }
       const uint8_t L = eng.SectionLength(sec);
@@ -985,13 +1004,17 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
       break;
     }
     case TOOL_POLY:
-      // TAP held: the selected voice's loop length, dark = follows the pattern
-      // (same display as the Length tool's TAP). Otherwise one LED per voice,
-      // lit = polymeter, with the master keys lit as labels; they go dark
-      // while running, when they are refused.
-      if (tapB.held()) {
-        const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
-        if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
+      // Voice-length phase: same blinking display as the Length tool's.
+      // Normal phase: one LED per voice, lit = polymeter, with the master keys
+      // lit as labels; they go dark while running, when they are refused.
+      if (s_ilen_phase) {
+        uint8_t L = eng.cur().ilen[inst % NUM_INSTRUMENTS];
+        if (!L) {
+          const uint8_t sl = eng.SectionLength(sec);
+          L = sl ? (uint8_t)(sec * NUM_STEP_BTNS + sl) : 0;
+        }
+        if (L && (uint8_t)((L - 1) >> 4) == sec && tempo_blink())
+          f = led_bit((uint8_t)((L - 1) & 15));
         break;
       }
       f = (uint16_t)(eng.cur().poly & 0x0FFF);
@@ -1271,7 +1294,7 @@ void loop() {
   // pattern comes back. A latched arp full of rests reads as a dead machine.
   static uint8_t s_tool_prev = TOOL_NONE;
   if (s_tool_prev == TOOL_ARP && s_tool != TOOL_ARP) eng.ArpClear();
-  if (s_tool != s_tool_prev) { s_prob_sel = 0xFF; s_ratchet_sel = 0xFF; }
+  if (s_tool != s_tool_prev) { s_prob_sel = 0xFF; s_ratchet_sel = 0xFF; s_ilen_phase = false; }
   s_tool_prev = s_tool;
 
   // 7. Web-editor MIDI link, outgoing side.
