@@ -578,10 +578,15 @@ static void handle_pattern_clear_mode() {
 // therefore phase-based, like PROBABILITY and RATCHET: a TAP toggles a phase,
 // the display blinks to show it, and the next step press acts in that phase.
 //
-// s_ilen_phase is the LENGTH / POLY tools' phase: set by a TAP, the next step
-// press writes the SELECTED VOICE's own loop length (absolute across the
-// sections), and a second TAP puts the voice back on the pattern. Cleared on
-// tool change.
+// s_ilen_phase is the LENGTH / POLY tools' mode switch, and TAP is the ONLY
+// thing that moves it: OFF = the tool's normal surface (master length / poly
+// switches), ON = every step press writes the SELECTED VOICE's own loop
+// length (absolute across the sections). It is deliberately STICKY: an
+// earlier draft dropped back to master mode after one press and cleared the
+// voice on the second TAP, and on hardware that read as the tool randomly
+// alternating between master and voice length. In voice mode, pressing the
+// step that already IS the voice's length toggles it off (the voice follows
+// the pattern again). Cleared on tool change.
 static bool s_ilen_phase = false;
 
 static void handle_tool(uint8_t tool, uint8_t inst) {
@@ -592,38 +597,34 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       // Bare step = this section's step count, the stock STEP NUMBER value:
       // the master length every voice follows by default.
       //
-      // TAP toggles the VOICE-LENGTH phase (the display blinks): the next step
-      // press sets the SELECTED VOICE's own loop length (absolute across the
-      // sections: section n, key k = n*16 + k + 1), so one voice can run
-      // shorter or longer than the bar. A second TAP instead puts the voice
-      // back to following the pattern. Whether the voice's loop free-runs
-      // against the bar or resets with it is that voice's switch in the POLY
-      // tool, whose TAP phase is this same one. The GLOBAL LENGTH override
-      // has no panel binding (eng.global_len stays for a future editor hook):
-      // its stint on TAP meant the natural polymeter gesture silently armed
-      // it, and the hold-TAP chord that replaced it turned out to be
-      // impossible on the hardware (see s_ilen_phase above).
+      // TAP toggles between MASTER mode (steps = this section's step count)
+      // and VOICE mode (the display blinks at the beat; steps = the SELECTED
+      // VOICE's own loop length, section n key k = n*16 + k + 1), so one
+      // voice can run shorter or longer than the bar. In voice mode, pressing
+      // the step that already is the voice's length clears it back to
+      // following the pattern. Whether the voice's loop free-runs against the
+      // bar or resets with it is that voice's switch in the POLY tool, whose
+      // TAP mode is this same one. The GLOBAL LENGTH override has no panel
+      // binding (eng.global_len stays for a future editor hook): its stint on
+      // TAP meant the natural polymeter gesture silently armed it, and the
+      // hold-TAP chord that replaced it is impossible on the hardware (see
+      // s_ilen_phase above).
       if (s_ilen_phase) {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
-            eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
+            const uint8_t L = (uint8_t)(sec * NUM_STEP_BTNS + b + 1);
+            eng.SetInstLength(inst, eng.cur().ilen[inst] == L ? 0 : L);
             midi_send_pattern_dump(eng.cur_pat);
-            s_ilen_phase = false;
             break;
           }
-        if (tapB.rising()) {
-          eng.SetInstLength(inst, 0);          // this voice follows the pattern
-          midi_send_pattern_dump(eng.cur_pat);
-          s_ilen_phase = false;
-        }
       } else {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
             eng.SetSectionLength(sec, (uint8_t)(b + 1));
             midi_send_layout_update(eng.cur_pat);
           }
-        if (tapB.rising()) s_ilen_phase = true;
       }
+      if (tapB.rising()) s_ilen_phase = !s_ilen_phase;
       break;
     case TOOL_PRESCALE:
       // Steps 1-4 set the PRE SCALE outright; the LED frame shows which one the
@@ -733,24 +734,20 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       // Both rewrite every pattern in the store, so they only fire while
       // stopped — the 606 puts them on CLEAR and TAP for the same reason.
       //
-      // TAP toggles the same VOICE-LENGTH phase as the Length tool's: the next
-      // step press sets the SELECTED VOICE's own loop length, a second TAP
-      // puts the voice back on the pattern. "TAP then a length" is the gesture
-      // an operator reaches for in THIS tool when setting up a polymeter, so
-      // it means the same thing in both places.
+      // TAP toggles the same sticky VOICE-LENGTH mode as the Length tool's:
+      // while it is on (display blinking at the beat), steps set the SELECTED
+      // VOICE's own loop length, and the step that already is the length
+      // clears it. "TAP then a length" is the gesture an operator reaches for
+      // in THIS tool when setting up a polymeter, so it means the same thing
+      // in both places.
       if (s_ilen_phase) {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
-            eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
+            const uint8_t L = (uint8_t)(sec * NUM_STEP_BTNS + b + 1);
+            eng.SetInstLength(inst, eng.cur().ilen[inst] == L ? 0 : L);
             midi_send_pattern_dump(eng.cur_pat);
-            s_ilen_phase = false;
             break;
           }
-        if (tapB.rising()) {
-          eng.SetInstLength(inst, 0);          // this voice follows the pattern
-          midi_send_pattern_dump(eng.cur_pat);
-          s_ilen_phase = false;
-        }
       } else {
         for (uint8_t b = 0; b < NUM_INSTRUMENTS; ++b)
           if (stepB[b].rising()) {
@@ -762,8 +759,8 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
           save_dirty(eng);
           for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
         }
-        if (tapB.rising()) s_ilen_phase = true;
       }
+      if (tapB.rising()) s_ilen_phase = !s_ilen_phase;
       break;
     case TOOL_MUTE:
       // Steps 1-12 are the voices (1 = ACCENT). Only 12 of the 16 keys can be a
@@ -938,17 +935,19 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
   uint16_t f = 0;
   switch (tool) {
     case TOOL_LENGTH: {
-      // Voice-length phase: BLINK the selected voice's own loop length (or,
-      // when the voice has none, the section length it currently follows), so
-      // the blink itself says "the next step press is this voice's length".
-      // Normal phase: this section's own step count, solid.
+      // Voice mode: BLINK the selected voice's own loop length AT THE BEAT
+      // (the play modes' flash rate), or, when the voice has none, the
+      // section length it currently follows; the blink itself says "steps set
+      // this voice's length now". Master mode: this section's own step count,
+      // solid.
       if (s_ilen_phase) {
         uint8_t L = eng.cur().ilen[inst % NUM_INSTRUMENTS];
         if (!L) {
           const uint8_t sl = eng.SectionLength(sec);
           L = sl ? (uint8_t)(sec * NUM_STEP_BTNS + sl) : 0;
         }
-        if (L && (uint8_t)((L - 1) >> 4) == sec && tempo_blink())
+        const bool on = eng.running ? eng.BeatBlink() : tempo_blink();
+        if (L && (uint8_t)((L - 1) >> 4) == sec && on)
           f = led_bit((uint8_t)((L - 1) & 15));
         break;
       }
@@ -1004,8 +1003,8 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
       break;
     }
     case TOOL_POLY:
-      // Voice-length phase: same blinking display as the Length tool's.
-      // Normal phase: one LED per voice, lit = polymeter, with the master keys
+      // Voice mode: same beat-rate blinking display as the Length tool's.
+      // Normal mode: one LED per voice, lit = polymeter, with the master keys
       // lit as labels; they go dark while running, when they are refused.
       if (s_ilen_phase) {
         uint8_t L = eng.cur().ilen[inst % NUM_INSTRUMENTS];
@@ -1013,7 +1012,8 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
           const uint8_t sl = eng.SectionLength(sec);
           L = sl ? (uint8_t)(sec * NUM_STEP_BTNS + sl) : 0;
         }
-        if (L && (uint8_t)((L - 1) >> 4) == sec && tempo_blink())
+        const bool on = eng.running ? eng.BeatBlink() : tempo_blink();
+        if (L && (uint8_t)((L - 1) >> 4) == sec && on)
           f = led_bit((uint8_t)((L - 1) & 15));
         break;
       }
@@ -1182,6 +1182,17 @@ void loop() {
   } else if (s_clk_edge_seen &&
              (uint32_t)(micros() - s_clk_edge_us) >= CLK_EDGE_GRACE_US) {
     s_clk_edge_seen = false;   // stale; also guards the ~71 min micros() wrap
+  }
+  // Feed the engine the measured 24-PPQN period, whichever clock is driving
+  // (internal, DIN sync, or MIDI): ratchet retrigger spacing derives from it.
+  // A burst of MIDI pulses drained in one pass averages across the burst;
+  // out-of-range intervals (first tick after silence) are rejected inside
+  // SetTickPeriod.
+  static uint32_t s_tick_us_prev = 0;
+  if (ticks) {
+    const uint32_t tus = micros();
+    if (s_tick_us_prev) eng.SetTickPeriod((uint32_t)(tus - s_tick_us_prev) / ticks);
+    s_tick_us_prev = tus;
   }
   for (uint8_t t = 0; t < ticks; ++t) {
     if (eng.ClockTick()) {

@@ -399,20 +399,22 @@ class Engine {
       tick_ = 1;
       return true;
     }
-    uint16_t due = 0;
-    for (uint8_t i = 0; i < NUM_INSTRUMENTS; ++i) {
-      if (rat_rem_[i] && tick_ == rat_next_[i]) {
-        due |= (uint16_t)1 << i;
-        rat_rem_[i]--;
-        rat_next_[i] = (uint8_t)(rat_next_[i] + rat_sp_[i]);
-      }
-    }
-    if (due) fire_pulse(due, rat_accent_);
     if (++tick_ >= step_len_()) tick_ = 0;
     return false;
   }
 
-  // Call every main-loop pass: ends a pending trigger pulse, clears step_advanced.
+  // Measured 24-PPQN tick period, fed each pass by the main loop from
+  // whichever clock is driving (internal, DIN sync or MIDI). Ratchet retrigger
+  // spacing is computed from it, so repeats stay even at any tempo and under
+  // any clock source. Smoothed 3:1 here; out-of-range readings (a start after
+  // silence, a glitched edge) are dropped rather than folded in.
+  void SetTickPeriod(uint32_t us) {
+    if (us < 2000UL || us > 200000UL) return;
+    tick_us_ = (tick_us_ * 3 + us) >> 2;
+  }
+
+  // Call every main-loop pass: ends a pending trigger pulse, clears
+  // step_advanced, and fires any ratchet retriggers that have come due.
   void Service() {
     step_advanced = false;
     if (pulse_on_ && (uint16_t)(micros() - pulse_t0_) >= TRIG_DATA_US) {
@@ -420,6 +422,25 @@ class Engine {
       for (uint8_t i = 0; i < NUM_INSTRUMENTS; ++i)
         digitalWrite(INSTRUMENT_PIN[i], LOW);
       pulse_on_ = false;
+    }
+    // Ratchet retriggers are MICROSECOND-scheduled, not tick-scheduled. On
+    // ticks the spacing base/(hits) truncates: a 4x ratchet on a 6-tick 16th
+    // landed its hits on ticks 0,1,2,3 — a rushed burst and then silence —
+    // and several other PRE SCALE x count combinations were similarly
+    // lopsided. Deadlines are set in fire_step from the measured tick period;
+    // the ~1 ms service cadence bounds the jitter, far below audibility at
+    // ratchet spacings (>= ~15 ms).
+    if (running) {
+      uint16_t due = 0;
+      const uint32_t now = micros();
+      for (uint8_t i = 0; i < NUM_INSTRUMENTS; ++i) {
+        if (rat_rem_[i] && (int32_t)(now - rat_next_us_[i]) >= 0) {
+          due |= (uint16_t)1 << i;
+          rat_rem_[i]--;
+          rat_next_us_[i] += rat_sp_us_[i];
+        }
+      }
+      if (due) fire_pulse(due, rat_accent_);
     }
     if (gather_active_ && !pulse_on_ &&
         (uint16_t)(micros() - gather_last_) >= TRIG_GATHER_US) {
@@ -788,10 +809,11 @@ class Engine {
     cache_dirty_ = false;
   }
 
-  uint8_t  rat_rem_[NUM_INSTRUMENTS]  = {0};
-  uint8_t  rat_sp_[NUM_INSTRUMENTS]   = {0};
-  uint8_t  rat_next_[NUM_INSTRUMENTS] = {0};
+  uint8_t  rat_rem_[NUM_INSTRUMENTS]      = {0};
+  uint32_t rat_sp_us_[NUM_INSTRUMENTS]    = {0};
+  uint32_t rat_next_us_[NUM_INSTRUMENTS]  = {0};
   bool     rat_accent_    = false;
+  uint32_t tick_us_       = 20833;   // 24-PPQN period, 120 BPM default
   uint8_t  reslice_start_ = 0;
   uint8_t  reslice_off_   = 0;
   uint8_t  arp_pos_       = 0;
@@ -932,17 +954,20 @@ class Engine {
     fired_accent_ = accent;
 
     if (!arp_len && mask) {
-      const uint8_t base = step_len_();
+      // Spacing = the step's real duration divided evenly among the hits,
+      // from the measured tick period, so repeats sit in time under the
+      // internal clock, DIN sync and MIDI alike (see the note in Service).
+      const uint32_t step_us = (uint32_t)step_len_() * tick_us_;
+      const uint32_t now = micros();
       rat_accent_ = accent;
       for (uint8_t i = 0; i < NUM_INSTRUMENTS; ++i) {
         if (!((mask >> i) & 1)) continue;
         const uint8_t e = p.ratchet_get(i, sis[i]);
         if (!e) continue;
-        uint8_t sp = (uint8_t)(base / (e + 1));
-        if (sp < 1) sp = 1;
-        rat_rem_[i]  = e;
-        rat_sp_[i]   = sp;
-        rat_next_[i] = sp;
+        const uint32_t sp = step_us / (uint32_t)(e + 1);
+        rat_rem_[i]     = e;
+        rat_sp_us_[i]   = sp;
+        rat_next_us_[i] = now + sp;
       }
     }
 
