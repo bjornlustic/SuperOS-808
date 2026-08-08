@@ -23,6 +23,19 @@ on top, and the set phase draws the current value as a bar.
 row did nothing, which is indistinguishable from a missed press. Anything above step 3 now
 also means 4x, as on the 606.
 
+**RATCHET had no key for "one hit".** The set phase mapped step 1 to a 2x retrigger, so the
+lowest value a key could write was a double: trying to clear a ratcheted step by pressing
+step 1 re-armed it and the step kept double-firing. The key number is now the total hit
+count: step 1 = a single hit (clears the ratchet), steps 2/3/4 = 2x/3x/4x, higher keys
+clamp to 4x, and the value bar lights one LED per hit.
+
+**PATTERN CLEAR was unusable: strobing LEDs, swallowed presses.** The mode's LED frame read
+all 16 patterns through the CRC-checked block store on every ~1 ms loop pass, over 20 ms
+of page reads and bitwise CRC per pass. The LED multiplex strobed visibly and most button
+presses fell between debounce samples, so slot selection and the CLEAR tap rarely
+registered. The slot-occupancy display is now served from a cached mask rebuilt only on
+mode entry, variation change, after a clear, and once a second while stopped.
+
 ### Added
 
 - **TAP as the tool layer's second key.** CLEAR is the gateway on this machine, so it
@@ -34,14 +47,16 @@ also means 4x, as on the 606.
   LENGTH moved to the Length tool (TAP + step), where the 606 keeps it.
 - **MUTE all / unmute all** on steps 15/16, and **COPY** gained clear-pattern on step 1,
   **TRANSFORM** gained randomize on step 4.
-- **Global length override**, the last of the 606's function-menu items: LENGTH tool,
+- **Global length override**, the last of the 606's function-menu items: POLYMETER tool,
   TAP + step forces that many steps on every pattern so a chain of differently written
-  patterns runs to one bar; TAP alone clears it, and a blinking length marker means it is
-  active. Runtime only, never saved. While it is set the measure is a flat run of N steps
-  and the 1st/2nd PART split is bypassed — a single number cannot describe a part layout,
-  and this is the 606's flat-pattern model, which is what makes step data past a short
-  part reachable. Per-voice loop length moved to the POLYMETER tool (TAP + step), next to
-  the switch that governs it, because the Length tool's one modifier is now spent.
+  patterns runs to one bar; TAP alone clears it, and a blinking length marker in the
+  LENGTH tool means it is active. Runtime only, never saved. While it is set the measure
+  is a flat run of N steps and the 1st/2nd PART split is bypassed — a single number cannot
+  describe a part layout, and this is the 606's flat-pattern model, which is what makes
+  step data past a short part reachable. The per-voice loop length rides the LENGTH tool's
+  TAP instead (TAP + step = the selected voice's own length, TAP alone = follow the
+  pattern), where the operator looks for a length first; the free-run switch it feeds
+  stays in POLYMETER.
 - **Web editor: probability and ratchet are editable per step.** The editor round-tripped
   both fields but exposed no way to set them; it now has a Steps / Probability / Ratchet
   layer selector, with per-voice loop length and polymeter on each row. Edits coalesce into
