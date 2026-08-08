@@ -53,14 +53,14 @@ the CPU for a few milliseconds).
   LENGTH moved to the Length tool (TAP + step), where the 606 keeps it.
 - **MUTE all / unmute all** on steps 15/16, and **COPY** gained clear-pattern on step 1,
   **TRANSFORM** gained randomize on step 4.
-- **Per-voice loop length on TAP in both length-minded tools.** LENGTH and POLYMETER both
-  treat TAP + step as "the selected voice's own loop length" (absolute across the
-  sections) and a bare TAP as "this voice follows the pattern". The gesture briefly meant
-  the 606-style global length override in one tool and the voice length in the other, and
-  the first hardware session showed why that fails: TAP + voice-key in POLYMETER, the
-  natural polymeter gesture, silently armed the override (a blinking LED, no poly change).
-  The global override lost its panel binding; the engine support remains for a future
-  editor hook.
+- **Per-voice loop length on TAP in both length-minded tools.** In LENGTH and POLYMETER a
+  TAP enters a blinking voice-length phase: the next step press sets the selected voice's
+  own loop length (absolute across the sections), and a second TAP puts the voice back on
+  the pattern. Two earlier shapes died on hardware in one session: TAP + step as a held
+  chord is physically impossible (the TAP status line reads as a short pulse, so `held()`
+  drops while the button is still down), and the global length override's stint on
+  POLYMETER's TAP meant the natural polymeter gesture silently armed it. The global
+  override lost its panel binding; the engine support remains for a future editor hook.
 - **Web editor: probability and ratchet are editable per step.** The editor round-tripped
   both fields but exposed no way to set them; it now has a Steps / Probability / Ratchet
   layer selector, with per-voice loop length and polymeter on each row. Edits coalesce into
