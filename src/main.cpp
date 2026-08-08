@@ -526,6 +526,31 @@ static void handle_compose(uint8_t inst) {
   if (tapB.rising()) eng.TapFill();
 }
 
+// PATTERN CLEAR slot-occupancy cache, for the mode's LED frame.
+//
+// Reading one pattern through the block store costs over a millisecond (a full
+// page read plus a bitwise CRC16 over ~240 bytes), and the frame needs all 16
+// slots. Doing that inline in build_frame() every pass stretched the ~1 ms loop
+// to ~20 ms: the LED multiplex strobed visibly and most button presses fell
+// between debounce samples, so the mode read as dead. The mask is rebuilt only
+// when it can be stale — mode entry, variation change, after a clear, and once
+// a second while stopped (to track editor pushes) — never per pass.
+static uint16_t s_occ_mask = 0;
+static uint8_t  s_occ_var  = 0xFF;   // variation the mask was built for; 0xFF = stale
+static uint32_t s_occ_ms   = 0;
+
+static void occ_rebuild(uint8_t var) {
+  uint16_t m = 0;
+  for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
+    Pattern t;
+    eng.ReadPattern(pat_index(var, b), t);
+    if (!t.Empty()) m |= led_bit(b);
+  }
+  s_occ_mask = m;
+  s_occ_var  = var;
+  s_occ_ms   = millis();
+}
+
 // PATTERN CLEAR: pick a slot with a step button, then press CLEAR to erase it.
 // With BASIC VARIATION at AB both memories of the slot go at once (OM p.16).
 static void handle_pattern_clear_mode() {
@@ -537,6 +562,7 @@ static void handle_pattern_clear_mode() {
     midi_send_pattern_dump(pat_index(0, eng.sel_slot));
     midi_send_pattern_dump(pat_index(1, eng.sel_slot));
     if (!eng.running) save_dirty(eng);
+    s_occ_var = 0xFF;                 // the mask just changed: rebuild it
   }
 }
 
@@ -554,28 +580,31 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
 
   switch (tool) {
     case TOOL_LENGTH:
-      // Bare step = this section's step count, the stock STEP NUMBER value.
+      // Bare step = this section's step count, the stock STEP NUMBER value —
+      // the master length every voice follows by default.
       //
-      // TAP + step = GLOBAL LENGTH: force that many steps on every pattern,
-      // absolute across the sections (section n, key k = n*16 + k + 1), which is
-      // what makes a chain of differently written patterns run to one bar. A
-      // bare TAP clears it and every pattern goes back to its own layout. The
-      // 606 puts these on GROUP + step and CLEAR; this machine has one free
-      // modifier, so both ride TAP and the release carries the clear.
-      //
-      // The override is a performance control, not pattern data: it is never
-      // saved, and it bypasses the part split while it is on (see pos_to_abs_).
+      // TAP + step = the SELECTED VOICE's own loop length (absolute across the
+      // sections: section n, key k = n*16 + k + 1), so one voice can run
+      // shorter or longer than the bar. A bare TAP puts that voice back to
+      // following the pattern. Whether the voice's loop free-runs against the
+      // bar or resets with it is that voice's switch in the POLY tool. The
+      // GLOBAL LENGTH override that used to sit on TAP here lives on the POLY
+      // tool's TAP now.
       for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
         if (stepB[b].rising()) {
           if (tapB.held()) {
             s_tap_used = true;
-            eng.global_len = (uint8_t)(sec * NUM_STEP_BTNS + b + 1);
+            eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
+            midi_send_pattern_dump(eng.cur_pat);
           } else {
             eng.SetSectionLength(sec, (uint8_t)(b + 1));
             midi_send_layout_update(eng.cur_pat);
           }
         }
-      if (tapB.falling() && !s_tap_used) eng.global_len = 0;
+      if (tapB.falling() && !s_tap_used) {
+        eng.SetInstLength(inst, 0);            // this voice follows the pattern
+        midi_send_pattern_dump(eng.cur_pat);
+      }
       break;
     case TOOL_PRESCALE:
       // Steps 1-4 set the PRE SCALE outright; the LED frame shows which one the
@@ -645,10 +674,11 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       }
       break;
     case TOOL_RATCHET:
-      // Same shape. Set: steps 1/2/3 = 2x/3x/4x retrigger, anything above also
-      // 4x (ratchet_set clamps), TAP = back to a single hit. The set phase used
-      // to read only steps 1-4 and ignore the rest, so most of the row was dead
-      // with no way to tell that from a missed press.
+      // Same shape. Set: the key number is the TOTAL hit count — key 1 = a
+      // single hit (which CLEARS the ratchet), 2/3/4 = 2x/3x/4x retrigger,
+      // anything above also 4x (ratchet_set clamps). TAP also = single hit.
+      // Key 1 used to mean 2x, so there was no key that put a step back to one
+      // hit: "clearing" a ratcheted step re-armed it and it kept double-firing.
       if (s_ratchet_sel == 0xFF) {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) { s_ratchet_sel = (uint8_t)(sec * NUM_STEP_BTNS + b); break; }
@@ -660,7 +690,7 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       } else {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
-            eng.cur().ratchet_set(inst, s_ratchet_sel, (uint8_t)(b + 1));
+            eng.cur().ratchet_set(inst, s_ratchet_sel, b);   // key n = n hits
             eng.mark_pat_dirty(eng.cur_pat);
             s_ratchet_sel = 0xFF;
             midi_send_pattern_dump(eng.cur_pat);
@@ -684,12 +714,15 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       // Both rewrite every pattern in the store, so they only fire while
       // stopped — the 606 puts them on CLEAR and TAP for the same reason.
       //
-      // TAP + step = the SELECTED VOICE's own loop length (absolute, so it can
-      // run past the shown section), and a bare TAP puts that voice back to
-      // following the pattern. It lives here rather than in the Length tool
-      // because the Length tool's one modifier is spent on the global override,
-      // and because this is the length the poly switch above operates on: a row
-      // with no length of its own has nothing to free-run against.
+      // TAP + step = GLOBAL LENGTH: force that many steps on every pattern,
+      // absolute across the sections (section n, key k = n*16 + k + 1), which
+      // is what makes a chain of differently written patterns run to one bar.
+      // A bare TAP clears it and every pattern goes back to its own layout.
+      // It traded places with the per-voice length, which now rides the Length
+      // tool's TAP where the operator looks for it first.
+      //
+      // The override is a performance control, not pattern data: it is never
+      // saved, and it bypasses the part split while it is on (see pos_to_abs_).
       // No early break out of the TAP branch: held() is still true on the pass
       // that reports falling() (the debounce shift register reads 0b100 there),
       // so bailing out here would mean the bare-TAP action below never runs.
@@ -697,8 +730,7 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
             s_tap_used = true;
-            eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
-            midi_send_pattern_dump(eng.cur_pat);
+            eng.global_len = (uint8_t)(sec * NUM_STEP_BTNS + b + 1);
           }
       } else {
         for (uint8_t b = 0; b < NUM_INSTRUMENTS; ++b)
@@ -712,10 +744,7 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
           for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
         }
       }
-      if (tapB.falling() && !s_tap_used) {
-        eng.SetInstLength(inst, 0);            // this voice follows the pattern
-        midi_send_pattern_dump(eng.cur_pat);
-      }
+      if (tapB.falling() && !s_tap_used) eng.global_len = 0;
       break;
     case TOOL_MUTE:
       // Steps 1-12 are the voices (1 = ACCENT). Only 12 of the 16 keys can be a
@@ -840,12 +869,15 @@ static uint16_t build_frame(uint8_t mode, uint8_t inst) {
 
   if (mode == MODE_PATTERN_CLEAR) {
     // Every slot holding data lights, so you can see what you are erasing; the
-    // selected one is inverted.
-    for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
-      Pattern t;
-      eng.ReadPattern(pat_index(varVal == VAR_B ? 1 : 0, b), t);
-      if (!t.Empty()) f |= led_bit(b);
-    }
+    // selected one is inverted. Served from the occupancy cache — see
+    // occ_rebuild for why this must never hit the store every pass. Rebuilds
+    // only run while stopped: a ~20 ms rebuild under a running clock would
+    // slip ticks, and clearing is a stopped operation anyway.
+    const uint8_t v = (varVal == VAR_B) ? 1 : 0;
+    if (!eng.running &&
+        (s_occ_var != v || (uint32_t)(millis() - s_occ_ms) > 1000))
+      occ_rebuild(v);
+    f = s_occ_mask;
     f ^= led_bit(eng.sel_slot);
     return f;
   }
@@ -877,8 +909,14 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
   uint16_t f = 0;
   switch (tool) {
     case TOOL_LENGTH: {
-      // A BLINKING marker means the global override is running the show; solid
-      // means this section's own step count. Same tell as the 606's.
+      // TAP held: the selected voice's own loop length, dark = follows the
+      // pattern. Otherwise a BLINKING marker means the global override is
+      // running the show; solid means this section's own step count.
+      if (tapB.held()) {
+        const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
+        if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
+        break;
+      }
       if (eng.global_len) {
         const uint8_t L = eng.global_len;
         if ((uint8_t)((L - 1) >> 4) == sec && tempo_blink()) f = led_bit((uint8_t)((L - 1) & 15));
@@ -930,18 +968,19 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
         f = tempo_blink() ? (uint16_t)(f | rm) : (uint16_t)(f & ~rm);
       } else {
         const uint8_t e = eng.cur().ratchet_get(inst, s_ratchet_sel);
-        for (uint8_t b = 0; b < (e ? e : 1); ++b) f |= led_bit(b);   // 1 = single hit
+        for (uint8_t b = 0; b <= e; ++b) f |= led_bit(b);   // n LEDs = n hits
         if (tempo_blink() && (s_ratchet_sel >> 4) == sec) f ^= led_bit((uint8_t)(s_ratchet_sel & 15));
       }
       break;
     }
     case TOOL_POLY:
-      // TAP held: the selected voice's loop length, dark = follows the pattern.
+      // TAP held: the global length override, blinking, dark = no override.
       // Otherwise one LED per voice, lit = polymeter, with the master keys lit
       // as labels — they go dark while running, when they are refused.
       if (tapB.held()) {
-        const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
-        if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
+        const uint8_t L = eng.global_len;
+        if (L && (uint8_t)((L - 1) >> 4) == sec && tempo_blink())
+          f = led_bit((uint8_t)((L - 1) & 15));
         break;
       }
       f = (uint16_t)(eng.cur().poly & 0x0FFF);
@@ -1169,6 +1208,7 @@ void loop() {
     anchor = -1;
     s_tool = TOOL_NONE;          // turning the dial lands you in a base mode
     if (!eng.running) save_dirty(eng);
+    s_occ_var = 0xFF;            // entering PATTERN CLEAR shows fresh data
     prev_mode = mode;
   }
   if (tools_ok && clr.map_open() && clearB.held()) {
