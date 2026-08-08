@@ -580,16 +580,21 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
 
   switch (tool) {
     case TOOL_LENGTH:
-      // Bare step = this section's step count, the stock STEP NUMBER value —
+      // Bare step = this section's step count, the stock STEP NUMBER value:
       // the master length every voice follows by default.
       //
       // TAP + step = the SELECTED VOICE's own loop length (absolute across the
       // sections: section n, key k = n*16 + k + 1), so one voice can run
       // shorter or longer than the bar. A bare TAP puts that voice back to
       // following the pattern. Whether the voice's loop free-runs against the
-      // bar or resets with it is that voice's switch in the POLY tool. The
-      // GLOBAL LENGTH override that used to sit on TAP here lives on the POLY
-      // tool's TAP now.
+      // bar or resets with it is that voice's switch in the POLY tool, whose
+      // TAP does the SAME thing as this one: the gesture means "this voice's
+      // own length" in either tool, because lengths are what both tools put
+      // on the operator's mind. The GLOBAL LENGTH override briefly sat on the
+      // POLY tool's TAP instead, and the first thing that happened on hardware
+      // is that TAP + voice-key there silently armed the override (a blinking
+      // LED, no poly change). It has no panel binding now; eng.global_len
+      // stays in the engine for a future editor hook.
       for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
         if (stepB[b].rising()) {
           if (tapB.held()) {
@@ -714,15 +719,13 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       // Both rewrite every pattern in the store, so they only fire while
       // stopped — the 606 puts them on CLEAR and TAP for the same reason.
       //
-      // TAP + step = GLOBAL LENGTH: force that many steps on every pattern,
-      // absolute across the sections (section n, key k = n*16 + k + 1), which
-      // is what makes a chain of differently written patterns run to one bar.
-      // A bare TAP clears it and every pattern goes back to its own layout.
-      // It traded places with the per-voice length, which now rides the Length
-      // tool's TAP where the operator looks for it first.
-      //
-      // The override is a performance control, not pattern data: it is never
-      // saved, and it bypasses the part split while it is on (see pos_to_abs_).
+      // TAP + step = the SELECTED VOICE's own loop length, identical to the
+      // Length tool's TAP, and a bare TAP puts the voice back on the pattern.
+      // "TAP + key = this voice's length" is the gesture an operator reaches
+      // for in THIS tool when setting up a polymeter, so it must mean the same
+      // thing here. Its brief stint as the global-override key meant the
+      // natural gesture silently armed the override (a blinking LED, no poly
+      // change); found on hardware within minutes of flashing.
       // No early break out of the TAP branch: held() is still true on the pass
       // that reports falling() (the debounce shift register reads 0b100 there),
       // so bailing out here would mean the bare-TAP action below never runs.
@@ -730,7 +733,8 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
             s_tap_used = true;
-            eng.global_len = (uint8_t)(sec * NUM_STEP_BTNS + b + 1);
+            eng.SetInstLength(inst, (uint8_t)(sec * NUM_STEP_BTNS + b + 1));
+            midi_send_pattern_dump(eng.cur_pat);
           }
       } else {
         for (uint8_t b = 0; b < NUM_INSTRUMENTS; ++b)
@@ -744,7 +748,10 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
           for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
         }
       }
-      if (tapB.falling() && !s_tap_used) eng.global_len = 0;
+      if (tapB.falling() && !s_tap_used) {
+        eng.SetInstLength(inst, 0);            // this voice follows the pattern
+        midi_send_pattern_dump(eng.cur_pat);
+      }
       break;
     case TOOL_MUTE:
       // Steps 1-12 are the voices (1 = ACCENT). Only 12 of the 16 keys can be a
@@ -920,16 +927,10 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
   switch (tool) {
     case TOOL_LENGTH: {
       // TAP held: the selected voice's own loop length, dark = follows the
-      // pattern. Otherwise a BLINKING marker means the global override is
-      // running the show; solid means this section's own step count.
+      // pattern. Otherwise this section's own step count, solid.
       if (tapB.held()) {
         const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
         if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
-        break;
-      }
-      if (eng.global_len) {
-        const uint8_t L = eng.global_len;
-        if ((uint8_t)((L - 1) >> 4) == sec && tempo_blink()) f = led_bit((uint8_t)((L - 1) & 15));
         break;
       }
       const uint8_t L = eng.SectionLength(sec);
@@ -984,13 +985,13 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
       break;
     }
     case TOOL_POLY:
-      // TAP held: the global length override, blinking, dark = no override.
-      // Otherwise one LED per voice, lit = polymeter, with the master keys lit
-      // as labels — they go dark while running, when they are refused.
+      // TAP held: the selected voice's loop length, dark = follows the pattern
+      // (same display as the Length tool's TAP). Otherwise one LED per voice,
+      // lit = polymeter, with the master keys lit as labels; they go dark
+      // while running, when they are refused.
       if (tapB.held()) {
-        const uint8_t L = eng.global_len;
-        if (L && (uint8_t)((L - 1) >> 4) == sec && tempo_blink())
-          f = led_bit((uint8_t)((L - 1) & 15));
+        const uint8_t il = eng.cur().ilen[inst % NUM_INSTRUMENTS];
+        if (il && (uint8_t)((il - 1) >> 4) == sec) f = led_bit((uint8_t)((il - 1) & 15));
         break;
       }
       f = (uint16_t)(eng.cur().poly & 0x0FFF);

@@ -53,16 +53,14 @@ the CPU for a few milliseconds).
   LENGTH moved to the Length tool (TAP + step), where the 606 keeps it.
 - **MUTE all / unmute all** on steps 15/16, and **COPY** gained clear-pattern on step 1,
   **TRANSFORM** gained randomize on step 4.
-- **Global length override**, the last of the 606's function-menu items: POLYMETER tool,
-  TAP + step forces that many steps on every pattern so a chain of differently written
-  patterns runs to one bar; TAP alone clears it, and a blinking length marker in the
-  LENGTH tool means it is active. Runtime only, never saved. While it is set the measure
-  is a flat run of N steps and the 1st/2nd PART split is bypassed — a single number cannot
-  describe a part layout, and this is the 606's flat-pattern model, which is what makes
-  step data past a short part reachable. The per-voice loop length rides the LENGTH tool's
-  TAP instead (TAP + step = the selected voice's own length, TAP alone = follow the
-  pattern), where the operator looks for a length first; the free-run switch it feeds
-  stays in POLYMETER.
+- **Per-voice loop length on TAP in both length-minded tools.** LENGTH and POLYMETER both
+  treat TAP + step as "the selected voice's own loop length" (absolute across the
+  sections) and a bare TAP as "this voice follows the pattern". The gesture briefly meant
+  the 606-style global length override in one tool and the voice length in the other, and
+  the first hardware session showed why that fails: TAP + voice-key in POLYMETER, the
+  natural polymeter gesture, silently armed the override (a blinking LED, no poly change).
+  The global override lost its panel binding; the engine support remains for a future
+  editor hook.
 - **Web editor: probability and ratchet are editable per step.** The editor round-tripped
   both fields but exposed no way to set them; it now has a Steps / Probability / Ratchet
   layer selector, with per-voice loop length and polymeter on each row. Edits coalesce into
