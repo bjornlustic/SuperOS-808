@@ -36,6 +36,12 @@ presses fell between debounce samples, so slot selection and the CLEAR tap rarel
 registered. The slot-occupancy display is now served from a cached mask rebuilt only on
 mode entry, variation change, after a clear, and once a second while stopped.
 
+**Config-menu settings did not survive a power cycle.** The menu edited the settings in RAM
+and nothing on the panel side ever wrote them to flash; only a save pushed from the web
+editor persisted them. Settings changed in the menu are now flushed to flash when the menu
+closes (deferred to the next stop if the sequencer is running, since a flash write stalls
+the CPU for a few milliseconds).
+
 ### Added
 
 - **TAP as the tool layer's second key.** CLEAR is the gateway on this machine, so it

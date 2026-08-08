@@ -808,18 +808,28 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
 // ---------------------------------------------------------------------------
 // Config menu (double-tap CLEAR)
 // ---------------------------------------------------------------------------
+// Settings changed here are flushed to flash once the menu closes (see the
+// s_settings_dirty site in loop()). The menu itself only edits RAM: the panel
+// used to leave it at that, so every menu change was lost at power-off unless
+// the web editor happened to push a save. A flash write halts the CPU for a
+// few ms, so the flush also waits for the sequencer to be stopped.
+static bool s_settings_dirty = false;
+
 static void handle_config_menu() {
-  if (stepB[0].rising()) { g_settings.midi_channel = 0; midi_send_settings(); }
+  if (stepB[0].rising()) { g_settings.midi_channel = 0; s_settings_dirty = true; midi_send_settings(); }
   if (stepB[1].rising()) {
     g_settings.midi_channel = (uint8_t)(g_settings.midi_channel >= 16 ? 1 : g_settings.midi_channel + 1);
+    s_settings_dirty = true;
     midi_send_settings();
   }
   if (stepB[4].rising()) {
     g_settings.clock_source = (uint8_t)(g_settings.clock_source == CLK_SRC_MIDI ? CLK_SRC_INTERNAL : CLK_SRC_MIDI);
+    s_settings_dirty = true;
     midi_send_settings();
   }
   if (stepB[5].rising()) {
     g_settings.out_mode = (uint8_t)(g_settings.out_mode == OUT_MODE_OUT ? OUT_MODE_THRU : OUT_MODE_OUT);
+    s_settings_dirty = true;
     midi_send_settings();
   }
   if (stepB[6].rising() && !eng.running) eng.ApplyMasterPoly(!eng.master_poly);
@@ -1171,6 +1181,15 @@ void loop() {
     s_menu_hold = true;
   }
   if (s_menu_hold && !clearB.held()) s_menu_hold = false;
+
+  // Flush menu-made settings to flash once the menu has closed and the
+  // sequencer is stopped (a flash write stalls the CPU for a few ms, which
+  // would slip the clock mid-playback). This is what makes panel config
+  // changes survive a power cycle.
+  if (s_settings_dirty && !s_menu && !eng.running) {
+    save_settings(g_settings);
+    s_settings_dirty = false;
+  }
 
   if (s_menu || s_menu_hold) {
     if (s_menu) handle_config_menu();
