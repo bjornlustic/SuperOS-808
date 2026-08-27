@@ -27,6 +27,7 @@
 #include <Arduino.h>
 #include "pins.h"
 #include "pattern.h"
+#include "lamp_probe.h"
 
 // Trigger timing, per service manual p.4 Figure 6.
 //
@@ -144,7 +145,24 @@ static const uint8_t INSTRUMENT_NOTE[NUM_INSTRUMENTS] = {
   42,   // CH  Closed Hi-Hat
 };
 
-static constexpr uint8_t CHAIN_MAX = 16;
+// Pattern chain depth. FOUR, the player's spec (claim-115): "max chain for
+// patterns is 4". It was 16, which nothing enforced a reason for.
+//
+// One constant caps every route, and that is the point of changing it here
+// rather than at the gestures: the panel's range gesture already stops at
+// CHAIN_MAX (main.cpp handle_manual_play) and SysEx 0x1A already clamps to it
+// (midi.cpp:481), so both follow without a second rule to keep in step. Holding
+// STEP 3 and pressing STEP 10 now chains STEP 3,4,5,6 rather than eight.
+//
+// It also buys 24 bytes of static RAM back, since chain[] and queued[] are both
+// CHAIN_MAX wide, which goes straight into the stack budget.
+static constexpr uint8_t CHAIN_MAX = 4;
+
+// SysEx 0x2E RANDOMIZE lane: every lane at once. Ratified fleet-wide, and it is
+// the ONLY lane value portable across the four machines, because lane 0 means
+// AC here, ACCENT on the 606, a note on the 101 and the WHOLE PATTERN on the
+// 303. A cross-machine schedule can use 0x7F and nothing else.
+static constexpr uint8_t LANE_ALL = 0x7F;
 
 // Play direction (DIRECTION tool). Runtime only, not persisted.
 enum PlayDir : uint8_t { DIR_FWD = 0, DIR_BCK = 1, DIR_RND = 2, DIR_PP = 3 };
@@ -156,6 +174,24 @@ enum PlayDir : uint8_t { DIR_FWD = 0, DIR_BCK = 1, DIR_RND = 2, DIR_PP = 3 };
 // stopped (or defers to the next stop).
 using PatReadFn  = bool (*)(uint8_t idx, Pattern &out);
 using PatWriteFn = bool (*)(uint8_t idx, const Pattern &in);
+
+// The same store, addressed by FIELD rather than by record: peek and patch a
+// few bytes at a known offset (PATTERN_LAYOUT_OFF, PATTERN_POLY_OFF), and clear
+// a slot outright.
+//
+// These exist because a record-shaped read-modify-write cannot be afforded above
+// a flash write on this machine. flash_pat_write's own chain is 333 B and
+// everything above it shares one 663-byte stack, so an operation that holds a
+// 228-byte Pattern to edit two bytes of it overflows wherever it sits: that is
+// claim-080, and it is why relocating those buffers never worked. The record
+// buffer stays inside the flash layer, where exactly one exists.
+//
+// Three callers, all the same shape: the A<->B layout mirror (5 bytes), the
+// master-poly switch (2 bytes, times 32 patterns), and PATTERN CLEAR (a
+// constant record the caller does not need to hold).
+using PatPeekFn  = bool (*)(uint8_t idx, uint8_t off, uint8_t *dst, uint8_t len);
+using PatPatchFn = bool (*)(uint8_t idx, uint8_t off, const uint8_t *src, uint8_t len);
+using PatClearFn = bool (*)(uint8_t idx);
 
 class Engine {
  public:
@@ -194,20 +230,42 @@ class Engine {
 
   // ---- SuperOS performance state (runtime; not persisted) ----
   uint8_t  play_dir   = DIR_FWD;
+  // Per-voice play direction (claim-119). 0xFF = follow the master.
+  //
+  // ENGINE STATE, not a Pattern field, and that is a deliberate match rather
+  // than a shortcut: the MASTER direction is engine state too, so storing the
+  // per-voice override in the record while the thing it overrides lives in RAM
+  // would be two different lifetimes for one control. It also costs no format
+  // change, and PATTERN_BYTES is the key the store loads records by, so growing
+  // the record makes every pattern already on the machine stop loading.
+  uint8_t  idir[NUM_INSTRUMENTS];
+  // Per-voice PRE SCALE (claim-124). 0xFF = follow the pattern's own.
+  uint8_t  ipre[NUM_INSTRUMENTS];
   // LENGTH tool: 0 = every pattern plays its own section layout, 1..64 = force
   // this many steps on ALL patterns, which is what lets a chain of differently
   // written patterns run to one bar. Runtime only and never persisted, exactly
   // as on the 606 — it is a performance override, not part of a pattern.
   uint8_t  global_len = 0;
   uint16_t mute_mask  = 0;      // bit per Instrument, 1 = muted (bit0 = accent)
-  bool     reslice_on  = false;
+  // RESLICE: the window in steps, 0 = off. ONE field, because a flag beside a
+  // window is two encodings of one fact and they drift apart at the edges: the
+  // old ResliceOff() cleared the flag and left the window set, and 0x45
+  // publishes the window on its own byte, so a host polling runtime state read
+  // a window that was not in effect. It also made `on && len == 0` sayable,
+  // which main.cpp's LED frame turns into led_bit(255).
   uint8_t  reslice_len = 0;
   uint8_t  arp[16];
   uint8_t  arp_len = 0;
 
-  void SetPatIO(PatReadFn r, PatWriteFn w) { pat_read_ = r; pat_write_ = w; }
+  void SetPatIO(PatReadFn r, PatWriteFn w, PatPeekFn pk = nullptr,
+                PatPatchFn pt = nullptr, PatClearFn pc = nullptr) {
+    pat_read_ = r; pat_write_ = w;
+    pat_peek_ = pk; pat_patch_ = pt; pat_clear_ = pc;
+  }
 
   void Init() {
+    memset(idir, 0xFF, sizeof(idir));    // every voice follows the master
+    memset(ipre, 0xFF, sizeof(ipre));    // ...at the pattern's own prescale
     for (uint8_t i = 0; i < NUM_TRACKS; ++i) track[i].Clear();
     cache_.Clear();
     cache_idx_ = 0xFF;
@@ -233,9 +291,62 @@ class Engine {
   void SetIndicators(uint8_t var_showing, bool part2) {
     ind_var_ = var_showing; ind_part2_ = part2;
     if (pulse_on_) return;
-    digitalWrite(LAMP_VAR_PIN,  var_showing == VAR_B ? HIGH : LOW);
-    digitalWrite(LAMP_PART_PIN, part2 ? HIGH : LOW);
+    drive_lamps_();
   }
+
+  // Put both shared lines back to their lamp level. Split out of
+  // SetIndicators so that Service() can call it AT THE INSTANT it releases the
+  // data lines (claim-111). It used to be reachable only from SetIndicators, at
+  // the far end of the main-loop pass, so every trigger left the pair at the
+  // instrument-data level for the whole tail of that pass on top of the data
+  // window itself -- and since PE1 LOW lights VARIATION A, a machine showing B
+  // blinked A on every hit. The tail grows with panel and USB work, so the glow
+  // got brighter the busier the host was.
+  //
+  // Safe at that point by the guard's own reasoning: `if (pulse_on_) return`
+  // treats the end of the TRIG_DATA_US window as the moment re-raising these
+  // lines can no longer reach IC6's stretched gate. Service() clearing
+  // pulse_on_ IS that moment, so this is the first legal instant, not an early
+  // one. What CANNOT be fixed here is the window itself: PE1 is the rim-shot
+  // data line, it has to sit LOW across the gate or the rim shot fires on every
+  // step, and VARIATION A is lit for exactly that long. The pair has no
+  // both-off state.
+  void drive_lamps_() {
+    const uint8_t want = (uint8_t)(ind_var_ == VAR_B ? HIGH : LOW);
+    digitalWrite(LAMP_VAR_PIN,  want);
+    digitalWrite(LAMP_PART_PIN, ind_part2_ ? HIGH : LOW);
+#ifdef SUPEROS_LAMP_PROBE
+    lamp_probe_edge(g_lamp_sos, want, want);   // back to the lamp's own level
+#endif
+  }
+  // End the trigger data window the moment TRIG_DATA_US has elapsed, and put
+  // the indicator pair back with it. Safe to call as often as you like: a no-op
+  // unless a pulse is in flight and due.
+  //
+  // CALLED FROM THE SCAN, NOT JUST FROM Service() (claim-128). claim-111 fixed
+  // WHAT restores the lamp; this fixes WHEN, and the player's report is why:
+  // "the a led still flickers when playing so that did not fix the problem."
+  //
+  // Measured against the 1981 program on the host (tools/d650/lamp_trace.sh):
+  // it holds PE1 low for 1197..1206 us per trigger -- a NINE MICROSECOND
+  // spread -- for a duty of 99.24% high and 1.4% RC ripple. SuperOS held it
+  // low for TRIG_DATA_US plus however long the rest of the loop pass took,
+  // which swings with USB traffic, flash work and what the display is drawing.
+  //
+  // THAT VARIANCE IS THE FLICKER. The average was never far off the original's;
+  // a steady 1% glow reads as a faintly lit lamp, while a 1% glow that
+  // modulates from pass to pass reads as flicker. The emulator does not have
+  // the problem because its lamp_service runs every 200 us, so its window ends
+  // on time rather than at the next convenient moment.
+  void EndPulseIfDue() {
+    if (!pulse_on_ || (uint16_t)(micros() - pulse_t0_) < TRIG_DATA_US) return;
+    digitalWrite(PI2_PIN, LOW);
+    for (uint8_t i = 0; i < NUM_INSTRUMENTS; ++i)
+      digitalWrite(INSTRUMENT_PIN[i], LOW);
+    pulse_on_ = false;
+    drive_lamps_();          // closes the excursion the probe is timing   // two of those pins are the indicator pair: claim-111
+  }
+
   // Which variation is SOUNDING right now — which is not the dial.
   //
   // Taken from cur_pat rather than from `variation`, because cur_pat is what
@@ -286,11 +397,47 @@ class Engine {
   }
 
   // ---- pattern cache --------------------------------------------------------
+  // Exchange two records without a third one on the stack. `t = a; a = b;
+  // b = t` would put a whole 228 B Pattern on the deepest path the sequencer
+  // has, in a build whose measured headroom is a few hundred bytes.
+  static void swap_records_(Pattern &a, Pattern &b) {
+    uint8_t *pa = (uint8_t *)&a, *pb = (uint8_t *)&b;
+    for (uint16_t i = 0; i < sizeof(Pattern); ++i) {
+      const uint8_t t = pa[i]; pa[i] = pb[i]; pb[i] = t;
+    }
+  }
+
   Pattern &cur() {
     if (cache_idx_ != cur_pat) {
       if (!running) {
         flush_();
       } else if (cache_dirty_ && cache_idx_ != 0xFF) {
+        // claim-103. THE PARK USED TO BE AN UNCONDITIONAL OVERWRITE, and with
+        // BASIC VARIATION on AB the sequencer alternates between TWO patterns,
+        // so every flip discarded the record parked at the previous flip. The
+        // player's symptom is the OTHER half reading back as whatever the
+        // store last held, which if it was never stored is empty: reported on
+        // hardware as "write to a while it is playing and b gets deleted".
+        //
+        // When the record being parked and the record being loaded are both
+        // live and unstored, this is an EXCHANGE, not an overwrite, and one
+        // slot is enough to do it. That is the AB case exactly: the pattern
+        // being flipped to is the one parked at the previous flip.
+        //
+        // No flash write is added. `pend_` exists because a store halts the
+        // CPU for milliseconds and cannot run under the clock, and a swap
+        // keeps that property: nothing reaches the store here.
+        if (pend_valid_ && pend_idx_ == cur_pat) {
+          swap_records_(cache_, pend_pat_);
+          pend_idx_    = cache_idx_;   // the outgoing record, still unstored
+          cache_idx_   = cur_pat;      // the incoming one, also still unstored
+          cache_dirty_ = true;
+          return cache_;               // pend_valid_ stays true
+        }
+        // Three or more distinct dirty patterns in flight (a chain, not AB)
+        // still cannot fit in one slot. The newest is kept and the parked one
+        // is lost, which is the pre-existing behaviour, now reached only in
+        // the case that genuinely overflows rather than on every AB flip.
         pend_pat_   = cache_;
         pend_idx_   = cache_idx_;
         pend_valid_ = true;
@@ -304,8 +451,65 @@ class Engine {
       } else if (!pat_read_ || !pat_read_(cache_idx_, cache_)) {
         cache_.Clear();
       }
+      // Direction travels WITH the pattern (claim-123), so adopt it whenever
+      // the addressed pattern changes. play_dir and idir[] stay as the live
+      // copies every read path already uses; this is the one place they are
+      // refilled, because this is the one place the record underneath them
+      // changes.
+      adopt_dir_();
     }
     return cache_;
+  }
+
+  // Live direction <- the record. Kept next to cur() rather than inlined into
+  // it so the pattern-push and SysEx paths can call it too.
+  void adopt_dir_() {
+    play_dir = (uint8_t)(cache_.dir & 3);
+    for (uint8_t i = 0; i < NUM_INSTRUMENTS; ++i) {
+      idir[i] = cache_.inst_dir_get(i);
+      ipre[i] = cache_.inst_pre_get(i);
+    }
+  }
+
+  // One tick of the voices that run on their OWN PRE SCALE (claim-124).
+  //
+  // WHY THIS EXISTS AT ALL. PRESCALE_TICKS is {8, 4, 6, 3}, so a voice can be
+  // FASTER than the pattern, and a faster voice has to sound BETWEEN the
+  // master's steps. That is why per-voice prescale is not the one-line change
+  // per-voice direction was: direction only picks a different index at the same
+  // instant, prescale picks a different instant.
+  //
+  // The 808 has ONE common trigger, so "between the master's steps" means an
+  // extra pulse, which is exactly what the ratchet machinery already does. This
+  // reuses fire_pulse the same way.
+  //
+  // Such a voice runs its OWN position counter and is SKIPPED by fire_step, so
+  // it is never sounded twice. Its own counter is also what polymeter free-run
+  // would have given it, so poly_pos_ is not consulted for it either.
+  void tick_voices_() {
+    uint16_t m = 0;
+    bool     acc = false;
+    const Pattern &p = cache_;
+    const uint8_t len = eff_len_();
+    for (uint8_t i = 0; i < NUM_INSTRUMENTS; ++i) {
+      if (ipre[i] == 0xFF) continue;
+      if (vtick_[i]) { --vtick_[i]; continue; }
+      vtick_[i] = (uint8_t)(PRESCALE_TICKS[ipre[i] & 3] - 1);
+      if (++vpos_[i] >= len) vpos_[i] = 0;
+      const uint8_t d = (idir[i] != 0xFF) ? idir[i] : play_dir;
+      uint8_t si = pos_to_abs_(dir_pos_(d, vpos_[i], len));
+      const uint8_t li = p.ilen[i];
+      if (li) si = (uint8_t)(si % li);
+      if (i == INST_AC) continue;               // the accent track has no pulse
+      if (p.step_get(i, si)) {
+        m |= (uint16_t)1 << i;
+        // The shared accent level, read at THIS voice's own step: an off-grid
+        // pulse with no accent reads as a voice that suddenly went quiet.
+        if (p.step_get(INST_AC, si)) acc = true;
+      }
+    }
+    m &= (uint16_t)~mute_mask;
+    if (m) fire_pulse(m, acc && !(mute_mask & 1));
   }
 
   void ReadPattern(uint8_t idx, Pattern &out) {
@@ -315,7 +519,17 @@ class Engine {
   }
   void WritePattern(uint8_t idx, const Pattern &in) {
     if (idx == cache_idx_) { cache_ = in; cache_dirty_ = true; return; }
-    if (!running && pat_write_) { pat_write_(idx, in); return; }
+    if (!running && pat_write_) {
+      // Drop a deferred record for this SAME slot before writing through
+      // (claim-097). While pend_ is valid it is authoritative -- resident_()
+      // returns it ahead of the store -- so leaving it behind means ReadPattern
+      // answers with the pre-edit record and the next Flush() writes that back
+      // over the one just stored. Only this slot's shadow goes: a deferred
+      // write to a different slot is still owed to the store.
+      if (pend_valid_ && pend_idx_ == idx) pend_valid_ = false;
+      pat_write_(idx, in);
+      return;
+    }
     pend_pat_ = in; pend_idx_ = idx; pend_valid_ = true;
   }
 
@@ -325,6 +539,39 @@ class Engine {
       if (pat_write_ && pend_idx_ != cache_idx_) pat_write_(pend_idx_, pend_pat_);
       pend_valid_ = false;
     }
+  }
+
+  // Apply ONE pending A<->B layout mirror; returns false when the queue is
+  // empty. superos_loop drains it once per pass, after the MIDI drain and
+  // before the transport section, so the sequencer never advances onto a
+  // sibling whose layout is still stale. See mirror_layout_to_sibling_ for why
+  // the request is deferred at all, and claim-080 for what it cost not to be.
+  //
+  // NO Pattern anywhere in here, and that is the point rather than a detail.
+  // The obvious implementation reads the sibling's record, edits five bytes and
+  // writes it back, and that is what the old mirror did. It cannot be afforded
+  // at ANY depth on this machine: flash_pat_write's own chain is 333 B and
+  // superos_loop's frame is 256, so a 228-byte record in between overflows the
+  // 663-byte stack wherever it sits. Five bytes in, five bytes out, and the one
+  // record buffer that has to exist stays inside the flash layer.
+  //
+  // noinline so the frame cannot migrate into superos_loop, which is the root of
+  // every chain here.
+  bool __attribute__((noinline)) ServiceLayoutSync() {
+    if (!layout_sync_req_) return false;
+    // Walk a running bit rather than recomputing (1UL << dst) each pass: the AVR
+    // has no barrel shifter, so a variable 32-bit shift is a loop, and doing one
+    // per iteration cost more flash than this whole function.
+    uint32_t bit = 1;
+    uint8_t  dst = 0;
+    while (!(layout_sync_req_ & bit)) { bit <<= 1; ++dst; }
+    layout_sync_req_ &= ~bit;
+    const uint8_t src = sibling_(dst);
+
+    uint8_t lay[PATTERN_LAYOUT_LEN];
+    if (!peek_layout_(src, lay)) return true;   // source unreadable: drop it
+    patch_layout_(dst, lay);
+    return true;
   }
 
   uint8_t active_prescale() const { return active_pre_; }
@@ -339,7 +586,7 @@ class Engine {
     pos_        = 0;
     first_      = true;
     pp_back_    = false;
-    reslice_on  = false;
+    reslice_len = 0;
     measure     = 0;
     ab_phase_   = 0;
     memset(rat_rem_, 0, sizeof(rat_rem_));
@@ -349,7 +596,7 @@ class Engine {
 
     if (track_play) {
       track_pos = 0;
-      if (track[cur_track].len > 0) sel_slot = track[cur_track].pat[0];
+      if (track[cur_track].len > 0) sel_slot = track[cur_track].pat(0);
     } else if (track_write) {
       // COMPOSE records in real time from measure 1; the operator clears the
       // track first (OM p.19).
@@ -372,11 +619,12 @@ class Engine {
 
   void Stop() {
     running     = false;
+    track_play  = false;
     track_write = false;
     step        = -1;
     tick_       = 0;
     queue_len   = 0;
-    reslice_on  = false;
+    reslice_len = 0;
     fill_now_   = false;
     fill_request = false;
     memset(rat_rem_, 0, sizeof(rat_rem_));
@@ -394,6 +642,7 @@ class Engine {
   // One 24-PPQN tempo-clock tick. Returns true on a step boundary.
   bool ClockTick() {
     if (!running) return false;
+    tick_voices_();                 // voices on their own PRE SCALE, every tick
     if (tick_ == 0) {
       advance_step();
       tick_ = 1;
@@ -404,7 +653,7 @@ class Engine {
   }
 
   // Measured 24-PPQN tick period, fed each pass by the main loop from
-  // whichever clock is driving (internal, DIN sync or MIDI). Ratchet retrigger
+  // whichever clock is driving (internal, rear sync or MIDI). Ratchet retrigger
   // spacing is computed from it, so repeats stay even at any tempo and under
   // any clock source. Smoothed 3:1 here; out-of-range readings (a start after
   // silence, a glitched edge) are dropped rather than folded in.
@@ -417,12 +666,7 @@ class Engine {
   // step_advanced, and fires any ratchet retriggers that have come due.
   void Service() {
     step_advanced = false;
-    if (pulse_on_ && (uint16_t)(micros() - pulse_t0_) >= TRIG_DATA_US) {
-      digitalWrite(PI2_PIN, LOW);
-      for (uint8_t i = 0; i < NUM_INSTRUMENTS; ++i)
-        digitalWrite(INSTRUMENT_PIN[i], LOW);
-      pulse_on_ = false;
-    }
+    EndPulseIfDue();
     // Ratchet retriggers are MICROSECOND-scheduled, not tick-scheduled. On
     // ticks the spacing base/(hits) truncates: a 4x ratchet on a 6-tick 16th
     // landed its hits on ticks 0,1,2,3 — a rushed burst and then silence —
@@ -462,15 +706,29 @@ class Engine {
   // editor's live cell edits ride on (SysEx 0x13): pushing a whole 261-byte
   // pattern per click would take ~90 ms of MIDI wire time and could not keep up
   // with a hand drawing a hi-hat line.
-  void SetPatternStep(uint8_t idx, uint8_t inst, uint8_t s, bool on) {
+  //
+  // `scratch` is caller-owned and is touched ONLY when idx is not the playing
+  // slot. It used to be a `Pattern` local, and that 228-byte frame made this the
+  // deepest mainline chain on the machine: 633 B against 663, which the USB
+  // endpoint ISR (33 B + 2) overflows -- while this very handler is running, on
+  // a path reached FROM USB data (claim-080). Same shape and same fix as
+  // claim-016, which took the identical temporary out of the dump and push
+  // paths: the buffer belongs in the shared arena, not on the stack and not in
+  // a static, which would trade the overflow for the same RAM.
+  //
+  // Note the branch. The playing slot returns early and never needs a buffer,
+  // so the cost lands only on edits to a NON-selected slot. That asymmetry is
+  // why an overflow here would present as intermittent, which is exactly how
+  // claim-016 read before it was found.
+  void SetPatternStep(uint8_t idx, uint8_t inst, uint8_t s, bool on,
+                      Pattern &scratch) {
     if (idx == cur_pat) {
       if (on) SetStep(inst, s); else ClearStep(inst, s);
       return;
     }
-    Pattern p;
-    ReadPattern(idx, p);
-    if (on) p.step_set(inst, s); else p.step_clr(inst, s);
-    WritePattern(idx, p);
+    ReadPattern(idx, scratch);
+    if (on) scratch.step_set(inst, s); else scratch.step_clr(inst, s);
+    WritePattern(idx, scratch);
   }
 
   // Set one section's step count. Mirrored onto the slot's OTHER variation:
@@ -524,19 +782,132 @@ class Engine {
     return (uint8_t)((uint8_t)step % li);
   }
 
+  // Can this instrument's own loop EVER reach this step of the record?
+  //
+  // fire_step reads the record at `si = (poly ? poly_pos_ : step) % ilen`, so
+  // with a loop length set, the only indices any voice ever reads are
+  // 0..ilen-1, whether or not it is running its own polymeter counter. Steps at
+  // or past that length are DEAD: still in the record, never sounded.
+  //
+  // The write display has to agree with that, and did not (claim-112). It bound
+  // the row by SectionLength alone, so a voice set to length 5 still lit hits on
+  // steps 6..16 that the machine would never play, and the panel claimed a
+  // rhythm you could not hear. This is the display's predicate, deliberately
+  // derived from the same `% ilen` that decides what sounds, rather than
+  // restated next to it where the two could drift apart.
+  //
+  // The record is NOT touched. The player's requirement is that the hidden
+  // steps survive ("they should still be saved in the pattern we just wont be
+  // able to see them"), so shortening a voice and lengthening it again brings
+  // the old steps back, exactly as it does for a section.
+  bool step_in_inst_loop(uint8_t inst, uint8_t s) {
+    if (inst >= NUM_INSTRUMENTS) return true;   // not ours to hide
+    const uint8_t li = cur().ilen[inst];
+    return !li || s < li;
+  }
+
+  // Per-voice direction. 0xFF clears the override and the voice follows the
+  // master again, which is how the panel turns one off.
+  void SetInstDir(uint8_t inst, uint8_t dir) {
+    if (inst >= NUM_INSTRUMENTS) return;
+    const uint8_t d = (dir > DIR_PP && dir != 0xFF) ? 0xFF : dir;
+    idir[inst] = d;
+    cur().inst_dir_set(inst, d);          // saved with the pattern (claim-123)
+    mark_pat_dirty(cur_pat);
+  }
+
+  // The pattern's own direction. Goes through here rather than assigning
+  // play_dir, so the record and the live copy cannot disagree.
+  void SetInstPre(uint8_t inst, uint8_t v) {
+    if (inst >= NUM_INSTRUMENTS) return;
+    const uint8_t n = (v > 3 && v != 0xFF) ? 0xFF : v;
+    ipre[inst] = n;
+    cur().inst_pre_set(inst, n);
+    mark_pat_dirty(cur_pat);
+    vtick_[inst] = 0; vpos_[inst] = 0;   // start on the pattern, not mid-stride
+  }
+  uint8_t GetInstPre(uint8_t inst) const {
+    return inst < NUM_INSTRUMENTS ? ipre[inst] : 0xFF;
+  }
+  bool InstPreOverridden(uint8_t inst) const {
+    return inst < NUM_INSTRUMENTS && ipre[inst] != 0xFF;
+  }
+
+  void SetPlayDir(uint8_t dir) {
+    play_dir = (uint8_t)(dir & 3);
+    cur().dir = play_dir;
+    mark_pat_dirty(cur_pat);
+  }
+  uint8_t GetInstDir(uint8_t inst) const {
+    return inst < NUM_INSTRUMENTS ? idir[inst] : 0xFF;
+  }
+  bool InstDirOverridden(uint8_t inst) const {
+    return inst < NUM_INSTRUMENTS && idir[inst] != 0xFF;
+  }
+  void ClearInstDirs() { memset(idir, 0xFF, sizeof(idir)); }
+
   bool master_poly = false;
+  // Two bytes of each of 32 patterns. This used to read, edit and write back a
+  // whole 228-byte record per pattern, which put the deepest chain on the
+  // machine above a flash write (claim-080: 570 B before its callers were even
+  // counted). A field patch touches the same two bytes and holds two.
+  // claim-118: this works WHILE PLAYING now, and the split is why it can.
+  //
+  // It used to be refused under the clock, for a real reason and not a timid
+  // one: it field-patches all 32 patterns, and a store write halts the CPU for
+  // milliseconds. That is the same fact pend_ exists for. Running it under the
+  // clock would drop ticks, which is exactly the "stay in time" the player
+  // asked not to lose.
+  //
+  // So the two halves are separated. The MUSICAL change -- master_poly, the
+  // live records, and the per-voice counters -- is pure RAM and happens at
+  // once, so the machine responds on the press. The STORE change is OWED and
+  // settled by ServiceMasterPoly() the moment the transport stops. Nothing
+  // reaches flash under the clock, so no tick is lost and the reset lands in
+  // time.
+  //
+  // While running only RESIDENT records are touched. patch_poly_ would write
+  // through to the store for any pattern that is not the cache or the deferred
+  // record, which is the halt being avoided.
   void ApplyMasterPoly(bool poly) {
     master_poly = poly;
     const uint16_t v = poly ? 0x0FFF : 0x0000;
-    for (uint8_t p = 0; p < NUM_PATTERNS; ++p) {
-      Pattern t;
-      ReadPattern(p, t);
-      if (t.poly == v) continue;
-      t.poly = v;
-      WritePattern(p, t);
+    if (running) {
+      if (cache_idx_ != 0xFF && cache_.poly != v) { cache_.poly = v; cache_dirty_ = true; }
+      if (pend_valid_) pend_pat_.poly = v;
+      master_poly_owed_ = true;
+    } else {
+      for (uint8_t p = 0; p < NUM_PATTERNS; ++p) patch_poly_(p, v);
+      master_poly_owed_ = false;
     }
-    memset(poly_pos_, 0, sizeof(poly_pos_));
+    // WHEN the voices realign, which took three attempts to land and is worth
+    // recording as all three.
+    //
+    //   at the bar      -- rejected: up to a whole measure of lag, which on a
+    //                      box you play by hand reads as the key not working.
+    //   instantly       -- rejected: it lands in the middle of a step, so a
+    //                      voice is cut part-way through and it is not clean.
+    //   the NEXT STEP   -- this. The smallest grid the machine has, so there is
+    //                      no audible lag, and it is still a boundary, so
+    //                      nothing is chopped mid-step.
+    //
+    // Stopped, there is no step boundary coming and nothing to be graceful
+    // about, so it applies at once.
+    if (running) poly_resync_ = true;
+    else         memset(poly_pos_, 0, sizeof(poly_pos_));
   }
+
+  // Settle a master-polymeter change made under the clock. Returns true if it
+  // actually wrote, so the caller knows to re-dump. Refuses while running for
+  // the same reason ApplyMasterPoly defers: this is the part that halts.
+  bool ServiceMasterPoly() {
+    if (!master_poly_owed_ || running) return false;
+    const uint16_t v = master_poly ? 0x0FFF : 0x0000;
+    for (uint8_t p = 0; p < NUM_PATTERNS; ++p) patch_poly_(p, v);
+    master_poly_owed_ = false;
+    return true;
+  }
+  bool MasterPolyOwed() const { return master_poly_owed_; }
 
   // PATTERN CLEAR. In the AB variation position the machine erases BOTH memories
   // at once: "When the AB position is set during the clearing operation, both A
@@ -559,6 +930,7 @@ class Engine {
     uint16_t v = cur().steps[inst][sec];
     v = right ? (uint16_t)((v >> 1) | (v << 15)) : (uint16_t)((v << 1) | (v >> 15));
     cur().steps[inst][sec] = v;
+    permute_attrs_(inst, sec, false, right);
     mark_pat_dirty(cur_pat);
   }
   void ReverseInst(uint8_t inst, uint8_t sec) {
@@ -566,23 +938,80 @@ class Engine {
     uint16_t r = 0;
     for (uint8_t i = 0; i < 16; ++i) if (v & (1u << i)) r |= (uint16_t)1 << (15 - i);
     cur().steps[inst][sec] = r;
+    permute_attrs_(inst, sec, true, false);
     mark_pat_dirty(cur_pat);
   }
   void RandomizeInst(uint8_t inst, uint8_t sec, uint8_t density) {
-    static const uint8_t thr[4] = { 40, 90, 140, 200 };
-    uint16_t v = 0;
-    for (uint8_t i = 0; i < 16; ++i) if (rng_u8() < thr[density & 3]) v |= (uint16_t)1 << i;
-    cur().steps[inst][sec] = v;
+    // The four panel detents expressed on the WIRE scale, so the panel tool and
+    // the 0x2E contract run the ONE generator in rand_section_ rather than two
+    // copies of the same loop. 40/90/140/200 out of 256 is 20/45/70/100 out of
+    // 128: the same probability to the bit. The drawn BITS differ (the wire
+    // compares the low 7 of the byte, this used to compare all 8), so a given
+    // PRNG stream now hits different steps than it did before c00f0b4. Nothing
+    // pins that, and a generator whose exact stream is load-bearing would be a
+    // defect in itself.
+    //
+    // len is 16, not the section length: the panel tool has always replaced the
+    // whole section, and steps past seclen keep a value that becomes visible if
+    // the section is later lengthened. Preserved deliberately, not inherited.
+    static const uint8_t thr[4] = { 20, 45, 70, 100 };
+    rand_section_(cur(), inst, sec, thr[density & 3], NUM_STEP_BTNS);
     mark_pat_dirty(cur_pat);
   }
 
-  void ResliceOn(uint8_t win) {
-    if (win < 1) win = 1;
-    if (win > NUM_STEP_BTNS) win = NUM_STEP_BTNS;
-    if (!reslice_on) { reslice_start_ = pos_; reslice_off_ = 0; }
-    reslice_on = true; reslice_len = win;
+  // SysEx 0x2E RANDOMIZE: the ratified fleet contract (claim-014, `343fbb9`).
+  // Returns the 0x14 ack status, 0 ok / 2 out of range; bad length is 1 and is
+  // the caller's, since only the caller can see the message.
+  //
+  // The range rule lives HERE, in one place, the way the 303's HostRandomize
+  // does, so the wire handler cannot drift from the panel path.
+  //
+  //   lane 0..11  ONE instrument, and lane 0 is AC on this machine per the 0x16
+  //               numbering (AC=0, BD=1 ... CH=11).
+  //   lane 0x7F   every lane.
+  //   lane 12..0x7E  REJECTED, and NOTHING changes. A rejected lane that
+  //               silently widens to the whole pattern is the 606 defect the
+  //               contract forbids and it is the load-bearing check. Both range
+  //               tests run before any mutation, so a rejected payload cannot
+  //               leave a half-randomized pattern behind.
+  //
+  // density 0..127 is the chance a step is a hit: 0 clears the lane, 127 fills
+  // it. This is the WIRE contract, which is the 303's (COMMON rule 5), and it
+  // is deliberately not the panel DENSITY tool's four detents.
+  //
+  // seed 0 draws from the machine's own PRNG. A nonzero seed is deterministic
+  // AND leaves the entropy stream untouched, so a G4 capture repeats and taking
+  // one does not perturb the next unseeded randomize.
+  //
+  // `scratch` is caller-owned and touched ONLY when `pat` is not the playing
+  // slot, the same shape and the same reason as SetPatternStep: a 228-byte
+  // record does not belong on this machine's stack above a flash write.
+  uint8_t HostRandomize(uint8_t pat, uint8_t lane, uint8_t density,
+                        uint16_t seed, Pattern &scratch) {
+    if (pat >= NUM_PATTERNS) return 2;
+    if (lane >= NUM_INSTRUMENTS && lane != LANE_ALL) return 2;
+    if (pat == cur_pat) {
+      randomize_into_(cur(), lane, density, seed);
+      mark_pat_dirty(cur_pat);
+    } else {
+      ReadPattern(pat, scratch);
+      randomize_into_(scratch, lane, density, seed);
+      WritePattern(pat, scratch);
+    }
+    return 0;
   }
-  void ResliceOff() { reslice_on = false; }
+
+  // win 0 is OFF, not a clamped 1: the caller that has no window and the caller
+  // that wants the tool off are the same caller, and main.cpp used to branch
+  // between ResliceOn and ResliceOff to say it.
+  void ResliceOn(uint8_t win) {
+    if (win > NUM_STEP_BTNS) win = NUM_STEP_BTNS;
+    if (!reslice_len && win) { reslice_start_ = pos_; reslice_off_ = 0; }
+    reslice_len = win;
+  }
+  void ResliceOff() { reslice_len = 0; }
+  bool    ResliceActive() const { return reslice_len != 0; }
+  uint8_t ResliceWindow() const { return reslice_len; }
 
   void ArpAdd(uint8_t inst) { if (arp_len < 16) arp[arp_len++] = inst; }
   void ArpClear() { arp_len = 0; arp_pos_ = 0; }
@@ -621,6 +1050,46 @@ class Engine {
     latch_prescale();
   }
   bool FillPlaying() const { return fill_now_; }
+
+  // The MANUAL PLAY / PLAY step-LED row: which slots are SPOKEN FOR, and which
+  // one is sounding. Lives here rather than in build_frame so it can be tested
+  // on the host at all -- main.cpp does not link into the host harness, and a
+  // test that re-implemented this would be asserting against a copy.
+  //
+  // claim-115. The chain and the queue were NEVER DRAWN. build_frame lit
+  // sel_slot and the fill and nothing else, so chaining four patterns lit one
+  // LED and queueing the next pattern lit none at all: the panel gave the
+  // player no way to see what they had just asked for. Reported as "i cant see
+  // the patterns light up red when they are changed" and "pressing the next
+  // pattern play it is blank".
+  //
+  // The rule is the stock machine's priority display (OM p.11, "the rhythm that
+  // will play first FLASHES, the other selected one stays lit") carried to the
+  // whole set: everything spoken for is LIT, and the one actually sounding
+  // BLINKS out of that set. That is the player's own description, "lit red
+  // until it plays then it blinks".
+  //
+  // The blink slot is CLEARED before it is re-set. It is normally also a chain
+  // member (chain_pos points at it), so leaving its steady bit in would hold it
+  // permanently on and the blink would never be visible -- which is the whole
+  // symptom this fixes, reintroduced one line later.
+  uint16_t play_row(bool blink_on) const {
+    uint16_t f = 0;
+    const bool    fill_first = intro_armed || FillPlaying();
+    const uint8_t flashing   = fill_first ? fill_slot : sel_slot;
+    const uint8_t steady     = fill_first ? sel_slot
+                                          : (intro_armed ? fill_slot : 0xFF);
+    if (steady < NUM_SLOTS) f |= (uint16_t)1 << steady;
+    for (uint8_t i = 0; i < chain_len && i < CHAIN_MAX; ++i)
+      f |= (uint16_t)1 << (chain[i] & (NUM_SLOTS - 1));
+    for (uint8_t i = 0; i < queue_len && i < CHAIN_MAX; ++i)
+      f |= (uint16_t)1 << (queued[i] & (NUM_SLOTS - 1));
+    if (flashing < NUM_SLOTS) {
+      f &= (uint16_t)~((uint16_t)1 << flashing);
+      if (blink_on) f |= (uint16_t)1 << flashing;
+    }
+    return f;
+  }
 
   // ---- pattern selection ----------------------------------------------------
   // The 808 finishes the measure it is playing before switching, "however, if
@@ -687,31 +1156,243 @@ class Engine {
   uint8_t  pos_        = 0;     // position within the measure, 0..total_len-1
   bool     first_      = true;
   bool     pp_back_    = false;
+  // claim-042. The note bits live in steps[inst][sec], but ratchet and
+  // probability are SPARSE maps keyed by ABSOLUTE step, so a permutation that
+  // moves only the bits strands them: the attribute stays on a step the hit has
+  // left. It is silent at the time (engine.h reads ratchet_get only for
+  // instruments that actually fire) and surfaces later, when some unrelated
+  // edit puts a hit back on that step and a ratchet the user never set for it
+  // starts firing. A303's claim-031 is the same invariant broken a different
+  // way. One helper for both maps because their layout is identical:
+  // 0xFF = free slot, high nibble of val = instrument.
+  static void permute_map_(uint8_t *step, const uint8_t *val, uint8_t n,
+                           uint8_t inst, uint8_t base, bool reverse, bool right) {
+    for (uint8_t k = 0; k < n; ++k) {
+      if (step[k] == 0xFF || (uint8_t)(val[k] >> 4) != inst) continue;
+      const uint8_t loc = (uint8_t)(step[k] - base);
+      if (loc >= 16) continue;      // unsigned wrap: not in this section
+      const uint8_t nl = reverse ? (uint8_t)(15 - loc)
+                                 : (uint8_t)((right ? loc + 15 : loc + 1) & 15);
+      step[k] = (uint8_t)(base + nl);
+    }
+  }
+  // Free every slot of `inst` in this section whose step carries no hit in
+  // `live`. Same claim-042 stranding, reached by replacement instead of by
+  // permutation.
+  static void prune_map_(uint8_t *step, const uint8_t *val, uint8_t n,
+                         uint8_t inst, uint8_t base, uint16_t live) {
+    for (uint8_t k = 0; k < n; ++k) {
+      if (step[k] == 0xFF || (uint8_t)(val[k] >> 4) != inst) continue;
+      const uint8_t loc = (uint8_t)(step[k] - base);
+      if (loc >= 16) continue;
+      if (!(live & ((uint16_t)1 << loc))) step[k] = 0xFF;
+    }
+  }
+  // The 0x2E generator. Only LIVE steps are touched: a section with seclen 0 is
+  // not part of the measure and is left exactly as it was, which is the same
+  // scope the 303 uses (it walks `s.length`). Steps past a section's length keep
+  // whatever they held.
+  //
+  // noinline so the loop body cannot migrate into handle_sysex, which is the
+  // root of the deepest chain on the loop root.
+  void __attribute__((noinline))
+  randomize_into_(Pattern &p, uint8_t lane, uint8_t density, uint16_t seed) {
+    const uint32_t save = rng_;
+    if (seed) rng_ = 0x2E000000UL | (uint32_t)seed;
+    const uint8_t lo = (lane == LANE_ALL) ? 0 : lane;
+    const uint8_t hi = (lane == LANE_ALL) ? (uint8_t)(NUM_INSTRUMENTS - 1) : lane;
+    for (uint8_t i = lo; i <= hi; ++i) {
+      for (uint8_t sec = 0; sec < NUM_SECTIONS; ++sec) {
+        uint8_t len = p.seclen[sec];
+        if (!len) continue;
+        if (len > NUM_STEP_BTNS) len = NUM_STEP_BTNS;
+        rand_section_(p, i, sec, density, len);
+      }
+    }
+    // A seeded run must not consume the machine's entropy, or the NEXT unseeded
+    // randomize becomes a function of how many captures were taken.
+    if (seed) rng_ = save;
+  }
+
+  // ONE generator, shared by the panel DENSITY tool and the 0x2E wire contract.
+  // It was two copies of this loop and they cost 760 B of flash in a build with
+  // 170 B of headroom above the 0xD700 app ceiling (measured at c00f0b4, where
+  // the shipping env stopped linking). density is the WIRE scale 0..127.
+  //
+  // noinline for the reason every other Pattern-touching helper here is: it must
+  // not migrate into handle_sysex, the root of the deepest chain on the loop
+  // root, and it must not be emitted twice.
+  void __attribute__((noinline))
+  rand_section_(Pattern &p, uint8_t inst, uint8_t sec, uint8_t density,
+                uint8_t len) {
+    uint16_t v = p.steps[inst][sec];
+    uint16_t m = 1;
+    for (uint8_t k = 0; k < len; ++k, m = (uint16_t)(m << 1)) {
+      // ONE draw, in its own statement. `|` does not order its operands, so two
+      // draws in one expression make a seeded result a property of the compiler
+      // rather than of the seed -- the 303's claim-055, which was a live bug and
+      // not a style note.
+      const uint8_t r = (uint8_t)(rng_u8() & 0x7F);
+      if ((density >= 127) || (r < density)) v |= m;
+      else                                   v &= (uint16_t)~m;
+    }
+    p.steps[inst][sec] = v;
+    // Not a permutation: it REPLACES the section, so every attribute in it
+    // described a hit that no longer exists and they all go (claim-042, and the
+    // 303's claim-082). `live = 0`, not v, and the difference is the whole
+    // point: keeping an attribute because randomize happened to re-hit that step
+    // would hand a new random hit a ratchet the user set for a different one.
+    // The G12 suite caught exactly that.
+    prune_attrs_(p, inst, sec, 0);
+  }
+
+  // Takes the record explicitly: HostRandomize reaches a slot that is not the
+  // playing one, and cur() would silently prune the WRONG pattern's attributes.
+  void prune_attrs_(Pattern &p, uint8_t inst, uint8_t sec, uint16_t live) {
+    const uint8_t base = (uint8_t)(sec * 16);
+    prune_map_(p.rstep, p.rval, RATCHET_SLOTS, inst, base, live);
+    prune_map_(p.pstep, p.pval, PROB_SLOTS,    inst, base, live);
+  }
+  void permute_attrs_(uint8_t inst, uint8_t sec, bool reverse, bool right) {
+    const uint8_t base = (uint8_t)(sec * 16);
+    Pattern &p = cur();
+    permute_map_(p.rstep, p.rval, RATCHET_SLOTS, inst, base, reverse, right);
+    permute_map_(p.pstep, p.pval, PROB_SLOTS,    inst, base, reverse, right);
+  }
+
   uint32_t rng_        = 0x808a55edUL;
   uint8_t  active_pre_ = 2;
   bool     fill_now_   = false; // this measure is playing an intro/fill
+  bool     master_poly_owed_ = false;  // claim-118: store patch owed to a stop
+  bool     poly_resync_      = false;  // claim-118: realign on the next step
   uint8_t  ab_phase_   = 0;     // AB variation: 0 = A measure, 1 = B measure
   uint8_t  ind_var_    = VAR_A;
   bool     ind_part2_  = false;
 
   uint8_t rng_u8() { rng_ = rng_ * 1664525UL + 1013904223UL; return (uint8_t)(rng_ >> 24); }
 
-  void clear_one_(uint8_t p) {
-    if (p == cache_idx_) { cache_.Clear(); cache_dirty_ = true; }
-    else { Pattern t; t.Clear(); WritePattern(p, t); }
+  // Musical position -> sounding position for one direction. Split out of
+  // advance_step so a VOICE can ask the same question the pattern does
+  // (claim-119); the master path is byte-for-byte what it was.
+  //
+  // DIR_RND draws per call ON PURPOSE: two voices both set to random should not
+  // walk in lockstep, which is what sharing one draw would do. DIR_PP reads the
+  // shared pp_back_, so a ping-pong voice turns around with the pattern rather
+  // than keeping a private phase nothing on the panel could show.
+  uint8_t dir_pos_(uint8_t dir, uint8_t p, uint8_t len) {
+    switch (dir) {
+      case DIR_BCK: return (uint8_t)(len - 1 - p);
+      case DIR_PP:  return pp_back_ ? (uint8_t)(len - 1 - p) : p;
+      case DIR_RND: return (uint8_t)(rng_u8() % len);
+      default:      return p;
+    }
   }
 
-  // Copy the layout fields (section lengths + prescale) onto the slot's other
-  // variation, which the machine keeps identical between A and B.
+  // A cleared pattern is a CONSTANT, so the caller has no reason to hold one.
+  // Building it on the stack to hand to the store cost 228 B above a flash
+  // write; the store writes the same bytes from its own record buffer
+  // (serialize_cleared_pattern, pinned byte-for-byte against
+  // serialize_pattern(Clear()) in tools/hosttest/record_fields.cpp).
+  void clear_one_(uint8_t p) {
+    Pattern *r = resident_(p);
+    if (r) {
+      r->Clear();
+      if (r == &cache_) cache_dirty_ = true;
+      return;
+    }
+    if (pat_clear_) pat_clear_(p);
+  }
+
+  // ASK for the layout fields (section lengths + prescale) to be copied onto the
+  // slot's other variation, which the machine keeps identical between A and B.
+  // ServiceLayoutSync does the copy, from the mainline, off this call chain.
+  //
+  // It used to do the copy here, reading the sibling's whole 228-byte record
+  // into a local to touch five bytes of it. That put a 235-byte frame on the
+  // SysEx path (handle_sysex -> SelectSlot -> latch_prescale -> here) and was
+  // the whole of claim-080's remaining overflow: 629 B peak against a 621 B
+  // usable budget, 663 minus the worst interrupt frame.
+  //
+  // A bitmask, NOT a saved copy of the five values. Two DIFFERENT siblings can
+  // be requested in one pass (two 0x1D messages in one midi_rx_poll drain) and
+  // a single saved request loses one; a bitmask accumulates and cannot. It also
+  // needs no values saved, because the source is always the request's PARTNER,
+  // read at service time, and the partner is normally cur_pat, which is already
+  // in cache_.
+  //
+  // Clearing cur_pat's own bit is what makes service ORDER not matter: the
+  // pattern just edited is the authority for its slot, so any earlier request to
+  // overwrite IT is stale by definition. Without this, editing A then B leaves
+  // both bits set and the result depends on which is popped first.
+  // A pattern index is var * NUM_SLOTS + slot and NUM_SLOTS is a power of two,
+  // so the OTHER variation of the same slot is one XOR rather than a divide, a
+  // modulo and a multiply. Asserted, because it silently addresses the wrong
+  // pattern if the slot count ever stops being a power of two.
+  static_assert((NUM_SLOTS & (NUM_SLOTS - 1)) == 0, "sibling_() assumes NUM_SLOTS is 2^n");
+  static uint8_t sibling_(uint8_t idx) { return (uint8_t)(idx ^ NUM_SLOTS); }
+
+  // One variable 32-bit shift, not two. The AVR has no barrel shifter so each is
+  // a loop, and the sibling's bit is a fixed distance from cur_pat's: NUM_SLOTS
+  // places up or down, which is a byte swap on a 32-bit mask.
   void mirror_layout_to_sibling_() {
-    const uint8_t sib = pat_index(pat_var(cur_pat) ^ 1, pat_slot(cur_pat));
-    Pattern t;
-    ReadPattern(sib, t);
-    bool changed = false;
-    for (uint8_t s = 0; s < NUM_SECTIONS; ++s)
-      if (t.seclen[s] != cache_.seclen[s]) { t.seclen[s] = cache_.seclen[s]; changed = true; }
-    if (t.prescale != cache_.prescale) { t.prescale = cache_.prescale; changed = true; }
-    if (changed) WritePattern(sib, t);
+    const uint32_t mine = (uint32_t)1 << cur_pat;
+    const uint32_t sib  = (cur_pat < NUM_SLOTS) ? (mine << NUM_SLOTS) : (mine >> NUM_SLOTS);
+    layout_sync_req_ = (layout_sync_req_ & ~mine) | sib;
+  }
+
+  // A pattern that is RESIDENT (the cache, or the one pending write) is answered
+  // from RAM and never reaches the store. That is the normal case for a field
+  // operation's source -- the mirror's source is cur_pat, which IS the cache --
+  // so the common path costs no buffer at either end.
+  Pattern *resident_(uint8_t idx) {
+    if (idx == cache_idx_)                    return &cache_;
+    if (pend_valid_ && idx == pend_idx_)      return &pend_pat_;
+    return nullptr;
+  }
+
+  // Typed accessors for the two field windows, not a generic byte-offset
+  // dispatcher: the offsets only have to be spoken to the STORE, where the
+  // record really is a byte array. A resident pattern is a struct and is touched
+  // as one. (The generic version compiled to 1.1 KB more flash and pushed
+  // combined-nat-test's app into the flash service's staging window.)
+  bool peek_layout_(uint8_t idx, uint8_t *lay) {
+    const Pattern *p = resident_(idx);
+    if (!p) {
+      if (!pat_peek_ || !pat_peek_(idx, PATTERN_LAYOUT_OFF, lay, PATTERN_LAYOUT_LEN))
+        return false;
+      // The clamp deserialize_pattern applies, for the same reason: a section
+      // length out of range would be mirrored onto the sibling verbatim.
+      for (uint8_t s = 0; s < NUM_SECTIONS; ++s)
+        if (lay[s] > NUM_STEP_BTNS) lay[s] = NUM_STEP_BTNS;
+      return true;
+    }
+    memcpy(lay, p->seclen, PATTERN_LAYOUT_LEN);   // contiguous, asserted in pattern.h
+    return true;
+  }
+  void patch_layout_(uint8_t idx, const uint8_t *lay) {
+    Pattern *p = resident_(idx);
+    if (!p) {
+      // Not resident. With no store there is no record to patch, so the request
+      // is dropped rather than fabricating an empty pattern to carry five bytes
+      // -- which is what the record-shaped version did, and it wrote a CLEARED
+      // sibling over a slot the store had never seen.
+      if (pat_patch_) pat_patch_(idx, PATTERN_LAYOUT_OFF, lay, PATTERN_LAYOUT_LEN);
+      return;
+    }
+    if (memcmp(p->seclen, lay, PATTERN_LAYOUT_LEN) == 0) return;   // already agrees
+    memcpy(p->seclen, lay, PATTERN_LAYOUT_LEN);
+    if (p == &cache_) cache_dirty_ = true;
+  }
+  void patch_poly_(uint8_t idx, uint16_t v) {
+    Pattern *p = resident_(idx);
+    if (!p) {
+      const uint8_t w[PATTERN_POLY_LEN] = { (uint8_t)(v & 0xFF), (uint8_t)(v >> 8) };
+      if (pat_patch_) pat_patch_(idx, PATTERN_POLY_OFF, w, PATTERN_POLY_LEN);
+      return;
+    }
+    if (p->poly == v) return;
+    p->poly = v;
+    if (p == &cache_) cache_dirty_ = true;
   }
 
   // Point cur_pat at the pattern the panel currently addresses.
@@ -741,7 +1422,7 @@ class Engine {
       }
     }
     Track &d = track[cur_track];
-    d.pat[d.len++] = sel_slot;
+    d.set_pat(d.len++, sel_slot);
     mark_trk_dirty(cur_track);
   }
 
@@ -766,8 +1447,20 @@ class Engine {
   // rounding error: it is the 606's flat-pattern model, which is what makes the
   // step data past a short part reachable without editing the part lengths.
   // Clearing the override restores the machine's own layout untouched.
+  //
+  // Both branches saturate rather than propagate an error, and they saturate
+  // the same way they always did: the override clamps a silly position to the
+  // last step, and the layout walk answers step 0 for a position no section
+  // covers. What changed with claim-051 is only that pos_to_step() now SAYS it
+  // failed instead of returning a value indistinguishable from step 0, so this
+  // is the one place that decides what to play and the next caller inherits a
+  // detectable error rather than a silent wrong step. Sounding behaviour is
+  // unchanged.
   uint8_t pos_to_abs_(uint8_t pos) {
-    if (!global_len) return cur().pos_to_step(pos);
+    if (!global_len) {
+      const uint8_t s = cur().pos_to_step(pos);
+      return s == POS_INVALID ? 0 : s;
+    }
     return pos >= MAX_STEPS ? (uint8_t)(MAX_STEPS - 1) : pos;
   }
 
@@ -800,9 +1493,19 @@ class Engine {
   bool       cache_dirty_ = false;
   PatReadFn  pat_read_    = nullptr;
   PatWriteFn pat_write_   = nullptr;
+  PatPeekFn  pat_peek_  = nullptr;
+  PatPatchFn pat_patch_ = nullptr;
+  PatClearFn pat_clear_ = nullptr;
   bool       pend_valid_  = false;
   uint8_t    pend_idx_    = 0;
   Pattern    pend_pat_;
+
+  // One bit per pattern: "this pattern's layout is stale, copy its partner's
+  // onto it". Set by mirror_layout_to_sibling_, drained by ServiceLayoutSync.
+  // NUM_PATTERNS is 32, so the mask is exactly a uint32_t; the static_assert
+  // keeps that honest if the slot count ever moves.
+  uint32_t   layout_sync_req_ = 0;
+  static_assert(NUM_PATTERNS <= 32, "layout_sync_req_ is a 32-bit mask");
 
   void flush_() {
     if (cache_dirty_ && pat_write_ && cache_idx_ != 0xFF) pat_write_(cache_idx_, cache_);
@@ -818,6 +1521,8 @@ class Engine {
   uint8_t  reslice_off_   = 0;
   uint8_t  arp_pos_       = 0;
   uint8_t  poly_pos_[NUM_INSTRUMENTS] = {0};
+  uint8_t  vtick_[NUM_INSTRUMENTS]    = {0};   // claim-124: ticks to this
+  uint8_t  vpos_[NUM_INSTRUMENTS]     = {0};   // voice's next step, and where
 
   void latch_prescale() {
     if (pending_prescale != 0xFF) {
@@ -830,6 +1535,14 @@ class Engine {
   }
 
   void advance_step() {
+    // The armed polymeter realign (claim-118), taken HERE because this is the
+    // step boundary: it lands before fire_step, so the very next step to sound
+    // is already aligned, and every voice comes back together on the same edge
+    // rather than wherever the press happened to fall inside a step.
+    if (poly_resync_) {
+      memset(poly_pos_, 0, sizeof(poly_pos_));
+      poly_resync_ = false;
+    }
     uint8_t len = eff_len_();
     if (first_) {
       first_ = false;
@@ -844,14 +1557,8 @@ class Engine {
 
     // Map the musical position to the sounding position by play direction, then
     // through the section layout to an absolute step index.
-    uint8_t q;
-    switch (play_dir) {
-      case DIR_BCK: q = (uint8_t)(len - 1 - p); break;
-      case DIR_PP:  q = pp_back_ ? (uint8_t)(len - 1 - p) : p; break;
-      case DIR_RND: q = (uint8_t)(rng_u8() % len); break;
-      default:      q = p; break;
-    }
-    if (reslice_on && reslice_len) {
+    uint8_t q = dir_pos_(play_dir, p, len);
+    if (reslice_len) {
       reslice_off_ = (uint8_t)((reslice_off_ + 1) % reslice_len);
       q = (uint8_t)((reslice_start_ + reslice_off_) % len);
     }
@@ -882,7 +1589,7 @@ class Engine {
       const Track &t = track[cur_track];
       if (t.len > 0 && !was_fill) {
         if (++track_pos >= t.len) track_pos = 0;
-        sel_slot = t.pat[track_pos];
+        sel_slot = t.pat(track_pos);
       }
     } else if (queue_len > 0 && (chain_len == 0 || chain_pos + 1 >= chain_len)) {
       memcpy(chain, queued, queue_len);
@@ -926,10 +1633,23 @@ class Engine {
       accent = false;
     } else {
       mask = 0;
+      // A voice with a direction override resolves its OWN sounding step from
+      // the shared musical position, so it reads the pattern backwards (or at
+      // random) while the rest of the machine runs forwards. Everything after
+      // that -- polymeter length, probability, ratchets -- is unchanged and
+      // operates on whatever step this voice landed on (claim-119).
+      const uint8_t len_ = eff_len_();
+      const uint8_t mp_  = pos_ >= len_ ? (uint8_t)(len_ - 1) : pos_;
       for (uint8_t i = 0; i < NUM_INSTRUMENTS; ++i) {
+        // A voice on its own PRE SCALE sounds from tick_voices_ and must not
+        // also be sounded here, or every one of its hits would double (claim-124).
+        if (ipre[i] != 0xFF) { sis[i] = s; continue; }
         const uint8_t li = p.ilen[i];
-        uint8_t si = s;
-        if (li) si = (uint8_t)((((p.poly >> i) & 1) ? poly_pos_[i] : s) % li);
+        uint8_t base = s;
+        if (idir[i] != 0xFF && idir[i] != play_dir && !reslice_len)
+          base = pos_to_abs_(dir_pos_(idir[i], mp_, len_));
+        uint8_t si = base;
+        if (li) si = (uint8_t)((((p.poly >> i) & 1) ? poly_pos_[i] : base) % li);
         sis[i] = si;
         if (i == INST_AC) accent = p.step_get(i, si);
         else if (p.step_get(i, si)) mask |= (uint16_t)1 << i;
@@ -956,7 +1676,7 @@ class Engine {
     if (!arp_len && mask) {
       // Spacing = the step's real duration divided evenly among the hits,
       // from the measured tick period, so repeats sit in time under the
-      // internal clock, DIN sync and MIDI alike (see the note in Service).
+      // internal clock, rear sync and MIDI alike (see the note in Service).
       const uint32_t step_us = (uint32_t)step_len_() * tick_us_;
       const uint32_t now = micros();
       rat_accent_ = accent;
@@ -997,6 +1717,13 @@ class Engine {
     }
     for (uint8_t i = INST_BD; i < NUM_INSTRUMENTS; ++i)
       digitalWrite(INSTRUMENT_PIN[i], (pulse_mask_ & ((uint16_t)1 << i)) ? HIGH : LOW);
+#ifdef SUPEROS_LAMP_PROBE
+    // The data window drives PE1 from the step mask, which is the level that
+    // fights the lamp whenever the rim shot is not in it.
+    lamp_probe_edge(g_lamp_sos,
+                    (uint8_t)((pulse_mask_ >> INST_RS) & 1 ? HIGH : LOW),
+                    (uint8_t)(ind_var_ == VAR_B ? HIGH : LOW));
+#endif
     digitalWrite(AC_PIN, pulse_accent_ ? HIGH : LOW);
     // Short strobe: IC6 turns this into the ~1 ms the voices need. The data
     // lines stay put until Service() clears them TRIG_DATA_US later, so they

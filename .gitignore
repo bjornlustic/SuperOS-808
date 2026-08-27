@@ -3,10 +3,9 @@
 .vscode/
 release/
 
-# build outputs (service-install.syx is a checked-in deliverable)
+# build outputs — nothing binary is checked in; releases carry the .syx/.hex
 *.syx
 *.hex
-!service-install.syx
 
 # generated locally from your own uPD650C-085; never commit
 src/d650/image_embed.h

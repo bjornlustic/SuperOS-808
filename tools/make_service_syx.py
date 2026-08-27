@@ -7,12 +7,12 @@ from intelhex import IntelHex
 
 # The SPM service lives in the empty top of the boot section. We emit a .syx
 # that writes only its pages via the existing bootloader updater (cmd 0x01).
-# HARD brick-safety bound: we must NEVER write a page below 0x1F4. Pages
-# 0x1F0..0x1F3 hold the RUNNING bootloader (writing them bricks the device, and
-# there is no ISP to recover) and lower pages hold the app / arena.
+# HARD brick-safety bound: we must NEVER write a page below 0x1F9. Pages
+# 0x1F0..0x1F8 hold the RUNNING bootloader (writing them from the bootloader
+# erases the code running the erase) and lower pages hold the app / arena.
 PAGE_SIZE = 256
-SAFE_MIN_PAGE = 0x1F4                 # first page above the running bootloader
-SAFE_MIN_ADDR = SAFE_MIN_PAGE * PAGE_SIZE  # 0x1F400
+SAFE_MIN_PAGE = 0x1F9                 # first page above the running bootloader
+SAFE_MIN_ADDR = SAFE_MIN_PAGE * PAGE_SIZE  # 0x1F900
 FLASH_END = 0x1FFFF
 
 syx_path = os.path.join(env["PROJECT_DIR"], "service-install.syx")

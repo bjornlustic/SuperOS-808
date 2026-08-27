@@ -57,22 +57,110 @@ inline bool flash_pat_read(uint8_t idx, Pattern &out) {
   // Cap at the full buffer, not PATTERN_BYTES: read() clamps to the cap, so a
   // longer record from an OLD format would otherwise clamp to exactly
   // PATTERN_BYTES and load truncated garbage instead of being rejected.
-  if (g_flash.read(FB_PATTERN_BASE + idx, buf, sizeof(buf)) != PATTERN_BYTES) return false;
+  // Accept the PRE-claim-123 record too and carry it forward. Direction was
+  // appended after poly, so an old record is a byte-exact PREFIX of a new one:
+  // zero-filling the tail yields DIR_FWD and "every voice follows the pattern",
+  // which are exactly the defaults. No conversion pass, no version byte, and
+  // nothing already on the machine stops loading -- which is what would have
+  // happened if PATTERN_BYTES had simply changed, since it IS the load key.
+  {
+    const uint8_t n = g_flash.read(FB_PATTERN_BASE + idx, buf, sizeof(buf));
+    if (n == PATTERN_BYTES_V1)
+      memset(buf + PATTERN_BYTES_V1, 0, PATTERN_BYTES - PATTERN_BYTES_V1);
+    else if (n != PATTERN_BYTES)
+      return false;
+  }
   deserialize_pattern(out, buf);
   return true;
 }
-inline bool flash_pat_write(uint8_t idx, const Pattern &in) {
-  if (!g_flash_ok) return false;
+// Kept out of flash_pat_write's frame (noinline) so its 243-byte buf never
+// coexists with gc()'s frame: flash_pat_write runs gc_if_full() first, at a
+// shallower depth where no buffer is reserved, then this appends. Together they
+// keep the push chain under the combined build's stack (claim-016).
+static __attribute__((noinline)) bool flash_pat_append(uint8_t idx, const Pattern &in) {
   uint8_t buf[FE_MAX_PAYLOAD];
   serialize_pattern(in, buf);
-  return g_flash.write(FB_PATTERN_BASE + idx, buf, PATTERN_BYTES);
+  return g_flash.append_only(FB_PATTERN_BASE + idx, buf, PATTERN_BYTES);
+}
+
+inline bool flash_pat_write(uint8_t idx, const Pattern &in) {
+  if (!g_flash_ok) return false;
+  if (!g_flash.gc_if_full()) return false;   // compact here, before buf exists
+  return flash_pat_append(idx, in);
+}
+
+// FIELD-level store access: read or patch a few bytes of a stored pattern, and
+// clear one, without the caller ever holding a record.
+//
+// This is what claim-080 came down to. Measured with tools/diag/stack_walk.py
+// once it learned to follow `ijmp`: flash_pat_write's own chain is 333 B, and
+// every operation above it shares one 663-byte stack, so a caller holding a
+// 228-byte Pattern to edit two bytes of it overflows wherever it sits. The three
+// callers that did (the A<->B mirror, master poly, PATTERN CLEAR) now hold at
+// most five bytes, and the ONE record buffer lives here.
+//
+// The buffer is shared between the read and the write-back within a single
+// frame, which is the other half of it: the read-modify-write through the Engine
+// put TWO record-sized buffers on one chain.
+// ONE worker for all three, because all three want the same 243-byte record
+// buffer and the same read prologue. Three copies of it cost ~450 B of flash,
+// and combined-nat-test has only ~900 B between the app and the flash service's
+// staging window (makesyx refuses the image past 0xD700), so on this machine
+// that is not a tidiness argument.
+enum : uint8_t { PAT_OP_PEEK = 0, PAT_OP_PATCH = 1, PAT_OP_CLEAR = 2 };
+
+static __attribute__((noinline)) bool flash_pat_rec_op_(
+    uint8_t idx, uint8_t op, uint8_t off, uint8_t *data, uint8_t len) {
+  uint8_t buf[FE_MAX_PAYLOAD];
+  if (op == PAT_OP_CLEAR) {
+    serialize_cleared_pattern(buf);
+    return g_flash.append_only(FB_PATTERN_BASE + idx, buf, PATTERN_BYTES);
+  }
+  {
+    const uint8_t n = g_flash.read(FB_PATTERN_BASE + idx, buf, sizeof(buf));
+    if (n == PATTERN_BYTES_V1)
+      memset(buf + PATTERN_BYTES_V1, 0, PATTERN_BYTES - PATTERN_BYTES_V1);
+    else if (n != PATTERN_BYTES)
+      return false;
+  }
+  if (op == PAT_OP_PEEK) {
+    memcpy(data, buf + off, len);      // raw bytes; the caller owns any clamp
+    return true;
+  }
+  bool changed = false;
+  for (uint8_t i = 0; i < len; ++i)
+    if (buf[off + i] != data[i]) { buf[off + i] = data[i]; changed = true; }
+  if (!changed) return true;           // identical: no write, so no flash wear
+  return g_flash.append_only(FB_PATTERN_BASE + idx, buf, PATTERN_BYTES);
+}
+
+// gc_if_full runs HERE, at a shallower depth than the buffer, which is the same
+// discipline flash_pat_write follows and the whole of claim-072.
+static bool __attribute__((noinline))
+flash_pat_op_(uint8_t idx, uint8_t op, uint8_t off, uint8_t *data, uint8_t len) {
+  if (!g_flash_ok) return false;
+  if ((uint16_t)off + len > PATTERN_BYTES) return false;
+  if (op != PAT_OP_PEEK && !g_flash.gc_if_full()) return false;
+  return flash_pat_rec_op_(idx, op, off, data, len);
+}
+
+inline bool flash_pat_peek(uint8_t idx, uint8_t off, uint8_t *dst, uint8_t len) {
+  return flash_pat_op_(idx, PAT_OP_PEEK, off, dst, len);
+}
+inline bool flash_pat_patch(uint8_t idx, uint8_t off, const uint8_t *src, uint8_t len) {
+  return flash_pat_op_(idx, PAT_OP_PATCH, off, const_cast<uint8_t *>(src), len);
+}
+inline bool flash_pat_clear(uint8_t idx) {
+  return flash_pat_op_(idx, PAT_OP_CLEAR, 0, nullptr, 0);
 }
 
 // Register the pattern hooks and load tracks. Patterns are loaded lazily by the
 // engine cache on first access. Power-on selection is deliberately NOT restored:
 // the device always wakes on pattern 1, variation A, like the stock 808.
 inline void load_all(Engine &eng) {
-  eng.SetPatIO(flash_pat_read, flash_pat_write);   // hooks self-guard on g_flash_ok
+  // hooks self-guard on g_flash_ok
+  eng.SetPatIO(flash_pat_read, flash_pat_write,
+               flash_pat_peek, flash_pat_patch, flash_pat_clear);
   if (!g_flash_ok) return;
   uint8_t buf[FE_MAX_PAYLOAD];
   for (uint8_t i = 0; i < NUM_TRACKS; ++i)
@@ -80,7 +168,7 @@ inline void load_all(Engine &eng) {
       deserialize_track(eng.track[i], buf);
 }
 
-inline void load_settings(Settings &s) {
+inline void __attribute__((noinline)) load_settings(Settings &s) {
   if (!g_flash_ok) return;
   uint8_t buf[FB_SETTINGS_LEN];
   if (g_flash.read(FB_SETTINGS, buf, FB_SETTINGS_LEN) == FB_SETTINGS_LEN &&
@@ -104,7 +192,7 @@ inline void save_settings(const Settings &s) {
 // docs/HARDWARE_MAP.md §7). A blank or magic-mismatched block leaves the
 // compiled defaults in place, so an uncalibrated device still boots and can be
 // driven through the calibration walk.
-inline void load_panel_map(PanelMap &m) {
+inline void __attribute__((noinline)) load_panel_map(PanelMap &m) {
   m.SetDefaults();
   if (!g_flash_ok) return;
   uint8_t buf[PANELMAP_BYTES];
@@ -126,14 +214,38 @@ inline void save_panel_map(const PanelMap &m) {
 // Write everything whose dirty bit is set, then clear the bits. On the flash
 // backend each page write halts the CPU for a few ms, so call only while the
 // sequencer is stopped.
+// Kept out of save_dirty's frame (noinline) for the same reason
+// flash_pat_append is kept out of flash_pat_write's: its 243-byte buf must never
+// coexist with gc()'s frame. save_dirty runs gc_if_full() first, at a shallower
+// depth where no buffer is reserved, then this appends.
+//
+// claim-072: claim-016 made exactly this split for the pattern-push path and
+// missed this one, because the analysis was a call chain added by hand and
+// nobody put save_dirty and gc() end to end. save_dirty is called from
+// superos_loop, whose own frame is 256 B, so the old
+//   superos_loop -> save_dirty(buf 243) -> write -> gc
+// reached 708 B against the combined build's 663 B budget.
+// buf is TRACK_BYTES (65), not FE_MAX_PAYLOAD (243). The original held the full
+// payload buffer for a record that serialize_track fills to exactly TRACK_BYTES
+// (`buf[0] = len` then TRACK_MAX_PATS bytes), so 178 of those bytes were never
+// written. Only the append path can size down like this: flash_pat_read must
+// keep the full buffer, because it caps read() at sizeof(buf) to reject an
+// over-long record from an older format instead of silently truncating it.
+static __attribute__((noinline)) bool flash_trk_append(uint8_t i, const Track &t) {
+  uint8_t buf[TRACK_BYTES];
+  serialize_track(t, buf);
+  return g_flash.append_only(FB_TRACK_BASE + i, buf, TRACK_BYTES);
+}
+
 inline void save_dirty(Engine &eng) {
   if (!g_flash_ok) return;
   eng.Flush();
-  uint8_t buf[FE_MAX_PAYLOAD];
   for (uint8_t i = 0; i < NUM_TRACKS; ++i) {
     if (!(eng.dirty_trk & ((uint16_t)1 << i))) continue;
-    serialize_track(eng.track[i], buf);
-    if (g_flash.write(FB_TRACK_BASE + i, buf, TRACK_BYTES))
+    // Compact here, before buf exists. A failed compaction leaves the track
+    // dirty rather than dropping it, so the next save retries.
+    if (!g_flash.gc_if_full()) continue;
+    if (flash_trk_append(i, eng.track[i]))
       eng.dirty_trk &= (uint16_t)~((uint16_t)1 << i);
   }
 }

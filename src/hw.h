@@ -5,14 +5,27 @@
 // (R76-R82), long harness to the switch board. The read schedule below is
 // deliberately clock-independent.
 //
-// There is no scan-freeze or clamp machinery here. These builds run with USB
-// torn down (see main.cpp), so nothing is injecting into the matrix, and
-// leaving it out keeps the read path single-branch — which matters on a device
-// that cannot be bench-probed.
+// There is no scan-freeze or clamp machinery here. Leaving it out keeps the read
+// path single-branch, which matters on a device that cannot be bench-probed. The
+// 15 K pull-downs above hold the sense lines at a defined level, and the read
+// schedule below is timed in microseconds so it is identical at any F_CPU.
+//
+// NOTE (usb-c branch): the earlier claim that "these builds run with USB torn
+// down, so nothing is injecting into the matrix" is no longer true. Both the
+// combined path (combined.cpp: usb_vbus_gate before superos_loop) and the app
+// path (main.cpp loop) keep the USB engine live during the scan whenever a cable
+// is present. Whether that injection reaches these 15 K-pulled lines the way it
+// reaches the 606's FLOATING status nets (findings 15-19) is a bench question,
+// unmeasured on the 808: see claim-008 item 3.
 #pragma once
 #include <Arduino.h>
 #include <string.h>
 #include "pins.h"
+
+// Called between scan columns, ~4x per pass. Defined in main.cpp: the scan
+// cannot see the engine, and the engine must not wait a whole pass to release
+// the shared indicator lines (claim-128).
+void scan_tick();
 
 namespace hw {
 
@@ -53,11 +66,27 @@ inline void AllOff() { PORTF = 0x0F; }
 // Established on hardware: at 4 MHz the per-pin digitalRead calls each took
 // ~12 us, so reads landed at +3/+15/+27/+39 us (PB) and +51/+63/+75/+87 us (PA)
 // after a select change, and the matrix behaved. At 16 MHz the same source reads
-// 4x earlier, before the high-impedance lines settle through the 15 K
-// pull-downs: pressed keys ghost into every row and the PA status lines read
-// phantom levels, which shows up as the sequencer auto-running at power-on.
-// Encoding the working schedule as explicit delays makes the scan identical at
-// any F_CPU. Do not shrink these without testing on hardware.
+// 4x earlier and the matrix does not: pressed keys ghost into every row and the
+// PA status lines read phantom levels, which shows up as the sequencer
+// auto-running at power-on. Encoding the working schedule as explicit delays
+// makes the scan identical at any F_CPU. Do not shrink these without testing on
+// hardware.
+//
+// WHAT IS ACTUALLY SLOW, because this comment used to say the wrong thing.
+// It said the reads landed "before the lines settle through the 15 K
+// pull-downs", which points at the rising edge. Simulated in
+// tools/spice/808_pa_sense.cir (see docs/gates/G13_808_SENSE_PATH.md), a driven
+// line reaches V_IH in ~13 ns: the rise is limited by the column driver, not by
+// the pull-down. The 15 K governs the FALL. Once a column deselects, its
+// encoder diode reverse-biases and the resistor is the sense net's only path to
+// ground, so the net takes ~2.2 us (100 pF harness) to fall below V_IL.
+//
+// That is why the symptom is a key ghosting into rows it is NOT in: what the
+// early read sees is the PREVIOUS column's charge still on the line. A
+// rise-limited fault could not produce that. SCAN_SETTLE_US below clears the
+// simulated worst case (2.98 us at the slow end of the harness-capacitance
+// range the hardware measurement bounds) with the 12 us inter-read gaps behind
+// it, so the schedule is right; only the explanation was wrong.
 static constexpr uint8_t SCAN_SETTLE_US   = 3;   // select change -> first read
 static constexpr uint8_t SCAN_READ_GAP_US = 12;  // spacing between pin reads
 
@@ -150,6 +179,11 @@ inline void ScanAndDisplay(uint16_t frame, uint8_t cell[4], uint8_t *status,
     delayMicroseconds(col_us);                           // LED dwell
     PORTF = 0x0F;        // park selects AND clear rows in ONE write before ISRs
     SREG = col_sreg;     // resume: a late ISR then lands on a fully dark matrix
+    // claim-128: the scan is most of the loop pass, so this is the only place
+    // fine enough to end a trigger's data window ON TIME. Between columns, with
+    // interrupts already restored, and it touches no PORTF bit -- the lines it
+    // may write are PORTD/PORTE -- so the matrix is undisturbed.
+    scan_tick();
   }
   PORTF = 0x0F;
 }

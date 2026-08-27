@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="250" viewBox="0 0 880 250" role="img" aria-label="The tool map: hold CLEAR, press a step">
+  <rect width="880" height="250" fill="#ffffff"/>
+  <rect x="24" y="16" width="832" height="34" rx="17" fill="#000"/>
+  <text x="440" y="38" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" letter-spacing="4" fill="#fff">THE TOOL MAP &#183; PRESS CLEAR</text>
+  <g font-family="Helvetica, Arial, sans-serif" text-anchor="middle">
+    <!-- generated key caps below -->
+<rect x="25" y="72" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="35" y="88" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">1</text>
+<text x="73.5" y="106" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">LENGTH</text>
+<text x="73.5" y="120" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">+ PRE-SCALE</text>
+<rect x="128" y="72" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="138" y="88" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">2</text>
+<text x="176.5" y="112" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">SWING</text>
+<rect x="231" y="72" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="241" y="88" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">3</text>
+<text x="279.5" y="106" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">COPY</text>
+<text x="279.5" y="120" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">/ PASTE</text>
+<rect x="334" y="72" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="344" y="88" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">4</text>
+<text x="382.5" y="106" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">TRANS-</text>
+<text x="382.5" y="120" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">FORM</text>
+<rect x="437" y="72" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="447" y="88" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">5</text>
+<text x="485.5" y="106" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">PROBA-</text>
+<text x="485.5" y="120" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">BILITY</text>
+<rect x="540" y="72" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="550" y="88" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">6</text>
+<text x="588.5" y="112" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">RATCHET</text>
+<rect x="643" y="72" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="653" y="88" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">7</text>
+<text x="691.5" y="106" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">POLY-</text>
+<text x="691.5" y="120" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">METER</text>
+<rect x="746" y="72" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="756" y="88" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">8</text>
+<text x="794.5" y="112" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">MUTE</text>
+<rect x="25" y="156" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="35" y="172" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">9</text>
+<text x="73.5" y="196" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">RESLICE</text>
+<rect x="128" y="156" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="138" y="172" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">10</text>
+<text x="176.5" y="196" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">ARP</text>
+<rect x="231" y="156" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="241" y="172" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">11</text>
+<text x="279.5" y="190" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">DIREC-</text>
+<text x="279.5" y="204" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">TION</text>
+<rect x="334" y="156" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="344" y="172" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">12</text>
+<text x="382.5" y="190" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">GENER-</text>
+<text x="382.5" y="204" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">ATE</text>
+<rect x="437" y="156" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="447" y="172" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">13</text>
+<text x="485.5" y="196" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">SAVE</text>
+<rect x="540" y="156" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="550" y="172" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="1">14</text>
+<text x="588.5" y="196" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#000">SECTION</text>
+<rect x="643" y="156" width="97" height="70" rx="6" fill="#fff" stroke="#000" stroke-width="2.5" stroke-opacity="0.25"/>
+<text x="653" y="172" text-anchor="start" font-size="11" font-weight="bold" fill="#000" fill-opacity="0.3">15</text>
+<rect x="746" y="156" width="97" height="70" rx="6" fill="#000" stroke="#000" stroke-width="2.5" stroke-opacity="1"/>
+<text x="756" y="172" text-anchor="start" font-size="11" font-weight="bold" fill="#fff" fill-opacity="1">16</text>
+<text x="794.5" y="190" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#fff">CONFIG</text>
+<text x="794.5" y="204" font-size="11.5" font-weight="bold" letter-spacing="0.5" fill="#fff">MENU</text>
+  </g>
+  <text x="440" y="238" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" letter-spacing="2" fill="#000">A STEP PRESS LATCHES THE TOOL &#183; THE LATCHED TOOL BLINKS &#183; STEP 16 IS THE CONFIG MENU</text>
+</svg>

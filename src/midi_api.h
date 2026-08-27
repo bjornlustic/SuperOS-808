@@ -23,10 +23,14 @@
 //     F0 7D 3B F7                                  raw panel-matrix probe
 //     F0 7D 3E <en> <lo7> <hi7> F7                 LED frame override (bench)
 //     F0 7D 3F <dwell_us> F7                       LED column dwell (bench)
+//     F0 7D 4A F7                                  reboot into the SysEx bootloader
 //     F0 7D 4D <fw 0|1> F7                         switch firmware (combined)
 //     F0 7D 50 <xor_lo> <xor_hi> <packed map> F7   write the panel decode table
 //     F0 7D 51 F7                                  begin guided calibration
 //     F0 7D 60 F7                                  request device info
+//     F0 7D 70 <idx 0-7> <xor_lo> <xor_hi> <packed> F7  stage a bootloader page
+//     F0 7D 71 <crc0> <crc1> <crc2> F7             commit the staged bootloader
+//     F0 7D 72 F7                                  request staging state
 //   808 -> editor
 //     F0 7D 11 <pat> <xor_lo> <xor_hi> <packed> F7 pattern dump
 //     F0 7D 14 <status> F7                         push ack (0 = ok)
@@ -40,6 +44,13 @@
 //                                                  bytes, ONE NIBBLE EACH)
 //     F0 7D 53 <xor_lo> <xor_hi> <packed map> F7   panel decode table dump
 //     F0 7D 61 <maj> <min> <flags> F7              device info
+//     F0 7D 73 <status> <crc0> <crc1> <crc2> F7    bootloader-staging status
+//
+// BOOTLOADER REPLACEMENT (0x70/0x71/0x72). The resident bootloader cannot
+// rewrite itself, so the app does it through the boot-section SPM service:
+// pages land in a staging window first and are committed only against a CRC16
+// the host computed over the same bytes. See boot_update.h for the safety
+// model and the one window in which a power cut still costs an ISP recovery.
 //
 // PANEL CALIBRATION. The rotary decode is data, not code (see
 // docs/HARDWARE_MAP.md §7). 0x3B returns exactly what the matrix reads right
@@ -119,6 +130,25 @@ bool midi_take_save_request(const Engine &eng);
 /// requested firmware id once, then -1.
 int8_t midi_take_fw_switch();
 
+/// Bootloader-reboot request from SysEx 0x4A: returns true once. The caller
+/// must flush pending saves, then park BOOT_MAGIC (0xB7) in GPIOR0 and jump to
+/// 0x1F000 so the resident bootloader stays up for a USB/DIN SysEx update.
+bool midi_take_boot_request();
+
+/// Bootloader-replacement commit request from SysEx 0x71: returns true once and
+/// hands back the CRC16 the host computed over the staged image. The caller must
+/// flush pending saves, call bootupd_commit(crc), and report the result with
+/// midi_send_bootupd_status(). See boot_update.h.
+bool midi_take_bootupd_commit(uint16_t &want_crc);
+
+/// Reply 0x73: a BOOTUPD_* status plus the CRC16 currently held in the staging
+/// window, so the host can tell a failed upload from a failed commit.
+void midi_send_bootupd_status(uint8_t status);
+
+/// Register the USB-MIDI SysEx handler (no-op unless built with
+/// SUPEROS_USB_MIDI). Call once from setup().
+void midi_usb_init();
+
 /// Queue a settings dump (0x31), sent on a 0x30 request and echoed after a
 /// 0x32 set so the editor always sees the applied (sanitized) values.
 void midi_send_settings();
@@ -141,3 +171,51 @@ void midi_set_probe(const uint8_t cell[4], uint8_t status);
 /// polling. Leaves automatically when the editor writes the table with 0x50.
 void midi_start_panel_calibration();
 bool midi_calibration_active();
+
+#ifdef SUPEROS_TESTHOOKS
+// ---------------------------------------------------------------------------
+// Test hooks (GOAL.md G12) -- never in a shipping build
+// ---------------------------------------------------------------------------
+// G12 requires every feature to be drivable AND observable headless, and rule 7
+// forbids handing the gap to a human. Two gaps on the 808, both measured in
+// docs/gates/G12_808_DRIVE_OBSERVE.md:
+//
+//   DRIVE:   no SysEx reaches the panel layer, so the 16-tool CLEAR layer, every
+//            rotary and every button (including the G4 edits "change length" and
+//            "randomize") have no host route at all.
+//   OBSERVE: the performance state the tools write lives in Engine, not in
+//            Pattern, so the 0x11 dump cannot see it. A chain set with 0x1A can
+//            never be read back.
+//
+// Both are compiled out unless SUPEROS_TESTHOOKS is defined (env:*-test). They
+// cost RAM and they let a host forge panel state, neither of which belongs on a
+// machine someone plays.
+
+/// Overlay the injected panel cells onto one live scan. main.cpp calls this
+/// immediately after ScanAndDisplay and before the debouncers, so an injected
+/// press runs the real decode table, the real debounce and the real gesture
+/// timer -- the point is to test the panel layer, not to bypass it.
+/// Per byte: out = (scan & ~mask) | (val & mask). Mask-and-value, not OR,
+/// because a rotary needs its PA nibble REPLACED (a rotary code of 0 is a
+/// legitimate detent), while a key press only needs a bit raised.
+/// Testhook bodies live in .testhook, which the test envs place at 0x17C60:
+/// inside the natcode window, above the 0xD700 app ceiling and below the
+/// 0x17E00 arena, which makesyx's own page rule already declares app-legal.
+/// The window clears the arena by ~430 B, which holds the two BIG hook
+/// bodies (the 0x4B parser and the 0x45 serializer, ~400 B together); the
+/// small per-scan hooks stay in the app region. The price is natcode regen
+/// clearance: any .natcode growth past 0x17C50 is now a LINK ERROR (overlap)
+/// instead of a makesyx warning, which is stricter, not looser. noinline is
+/// load-bearing: an inlined copy would land back in the caller's section.
+#define TESTHOOK_CODE __attribute__((noinline, used, section(".testhook")))
+
+void midi_panel_inject(uint8_t cell[4], uint8_t &status_hi);
+
+/// Engine runtime state (0x44 request -> 0x45 dump). Defined in main.cpp
+/// because the tool/menu UI state are its statics.
+uint8_t superos_ui_state();
+void    superos_blink_state(uint8_t *out);   // G10: 6 bytes, see main.cpp
+#ifdef SUPEROS_PCINT_ATTRIB
+void    superos_pcint_counts(uint8_t *out);  // 12 bytes, READ AND CLEARED
+#endif
+#endif

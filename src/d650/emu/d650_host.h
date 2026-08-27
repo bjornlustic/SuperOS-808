@@ -92,7 +92,9 @@ typedef struct {
 } d650_drivers;
 
 typedef struct {
+#ifndef UCOM4_SINGLETON
   ucom4_t  cpu;
+#endif
   uint8_t  ext[D650_EXT_BYTES]; // 4x µPD444C pattern/track store, packed nibbles
   uint8_t  ext_dirty;           // set when a RAM nibble changes (save trigger)
   uint8_t  in[D650_IN_COUNT];
@@ -102,6 +104,14 @@ typedef struct {
   d650_drivers drv;
 } d650_host;
 
+// The emulated CPU this host drives. One global object under UCOM4_SINGLETON
+// (see ucom4.h for why), a member otherwise.
+#ifdef UCOM4_SINGLETON
+#define D650_CPU(h) ((void)(h), &ucom4_the_cpu)
+#else
+#define D650_CPU(h) (&(h)->cpu)
+#endif
+
 // Initialize + reset. `prg` = the 2 KB TR-808 program image. `drv` may be NULL.
 void d650_init(d650_host *h, const uint8_t *prg, const d650_drivers *drv);
 
@@ -110,7 +120,11 @@ uint32_t d650_step(d650_host *h);
 
 // Run at least `cycles` machine cycles (batched; cheaper than stepping).
 static inline uint32_t d650_run(d650_host *h, uint32_t cycles) {
-  return ucom4_run(&h->cpu, cycles);
+#ifdef UCOM4_NATIVE
+  return ucom4_run_native(D650_CPU(h), (uint16_t)cycles);
+#else
+  return ucom4_run(D650_CPU(h), cycles);
+#endif
 }
 
 // Drive the /INT pin — the fixed interrupt clock, 1.9 ms period per the service

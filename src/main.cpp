@@ -22,19 +22,47 @@
 // has exactly one free momentary button to hang it off. See
 // docs/CONTROL_SCHEME.md for the CLEAR gesture design.
 
+#include <avr/wdt.h>
 #include <Arduino.h>
 #include <avr/interrupt.h>
+#include <util/delay.h>
 
 #include "pins.h"
+#include "usb_sof.h"
+#include "loop_acct.h"
 #include "hw.h"
 #include "controls.h"
 #include "pattern.h"
 #include "engine.h"
 #include "settings.h"
 #include "flash_persist.h"
+#include "boot_update.h"
 #include "midi_api.h"
 #ifdef SUPEROS_COMBINED
 #include "combined.h"
+#endif
+
+#ifdef SUPEROS_CPU_DIV4
+// Divide the core clock by 4: a 16 MHz crystal gives a 4 MHz CPU. This has to
+// run in .init3, ahead of the Arduino core's timer setup and the USB core's
+// usb_init(), so that every F_CPU-derived constant the build computed for
+// 4 MHz matches the clock that is actually running.
+//
+// USB survives this. CLKPR divides clkCPU, clkI/O, clkADC and clkFLASH only
+// (datasheet 7.9); clkUSB comes off the PLL, which is fed from XTAL1 and still
+// sees the full 16 MHz, so the 48 MHz USB reference and PLLCSR=0x16 both stay
+// correct. A 4 MHz CRYSTAL would be a different matter entirely: datasheet
+// Table 7-11 gives valid PLL prescaler words for 8 and 16 MHz sources only,
+// and marks every other combination Reserved, so USB would be impossible.
+//
+// The write is a timed sequence (CLKPCE, then the value within four cycles).
+// Interrupts are still off this early, so no cli/sei is needed. naked is
+// correct here: .init sections fall through and must not return.
+extern "C" __attribute__((naked, used, section(".init3")))
+void superos_clock_div4(void) {
+  CLKPR = _BV(CLKPCE);
+  CLKPR = _BV(CLKPS1);   // CLKPS = 0b0010 -> /4
+}
 #endif
 
 Settings g_settings;
@@ -62,6 +90,9 @@ static inline void midiNoteOff(uint8_t n) {
 // FIFO overflow and slip the sequencer off the incoming clock.
 static inline void midiRT(uint8_t b) {
   if (!midi_out_live()) return;
+#ifdef SUPEROS_USB_MIDI
+  if (usb_sof_alive()) usbMIDI.sendRealTime(b);
+#endif
   if (Serial1.availableForWrite() > 0) Serial1.write(b);
 }
 
@@ -149,7 +180,19 @@ static uint16_t frame        = 0;  // step-LED frame shown by ScanAndDisplay
 // timed release-to-release, which meant the gap plus the whole second press had
 // to land inside the window and an ordinary double-tap read as two singles.
 static const uint16_t CLEAR_TAP_MS  = 350;
-static const uint16_t CLEAR_HOLD_MS = 350;
+// claim-129 cut this 350 -> 150; claim-132 cuts it to ZERO. The player, on
+// the 150 ms build: "it should bring up the tool selection when i press the
+// clear button instantly no more waiting". The hold threshold only ever
+// bought a wait before the map appeared: the tap is recognised on RELEASE
+// and stays dt-based, so tap actions and the deferred-tap machinery are
+// untouched by the map being visible from the press. What IS gone is the
+// stock CLEAR+step chord in the write modes (it needed the pre-map window):
+// its function lives in the LENGTH tool, which the instant map makes
+// quicker to reach than the chord ever was. One behaviour this sharpens
+// deliberately: a latched tool now exits on the RELEASE of a bare CLEAR
+// press (the falling-edge unlatch used to need a 150 ms hold first), so
+// tool exit is instant too.
+static const uint16_t CLEAR_HOLD_MS = 0;
 static const uint16_t CLEAR_DTAP_MS = 600;
 static const uint16_t CLEAR_LONG_MS = 2000;
 
@@ -203,12 +246,30 @@ static ClearGesture clr;
 // Tool IDs == step number (1..16). See docs/CONTROL_SCHEME.md.
 enum {
   TOOL_NONE = 0,
-  TOOL_LENGTH = 1, TOOL_PRESCALE = 2, TOOL_COPY = 3, TOOL_XFORM = 4,
-  TOOL_ACCENT = 5, TOOL_PROB = 6, TOOL_RATCHET = 7, TOOL_POLY = 8,
-  TOOL_MUTE = 9, TOOL_RESLICE = 10, TOOL_ARP = 11, TOOL_DIR = 12,
-  TOOL_GEN = 13, TOOL_SAVE = 14, TOOL_SECTION = 15, TOOL_SWING = 16,
+  // claim-116. PRE SCALE is no longer a tool of its own: it folds into LENGTH,
+  // which is where the player already goes to decide how long a thing is. SWING
+  // takes the freed slot 2, and STEP 16 becomes the CONFIG MENU, so the menu is
+  // a place on the tool map rather than a gesture you have to know about.
+  TOOL_LENGTH = 1, TOOL_SWING = 2, TOOL_COPY = 3, TOOL_XFORM = 4,
+  // Slot 5 was ACCENT and is now EMPTY (claim-117). The 808's accent is a
+  // SINGLE SHARED LEVEL per step -- fire_pulse sets the amplitude of the one
+  // COMMON TRIG pulse, so every voice firing in that window is accented
+  // together and there is no such thing as accenting one instrument. The tool
+  // implied a per-instrument control the machine cannot have. The accent TRACK
+  // is unaffected: ACCENT is a position on the INSTRUMENT SELECT dial and is
+  // programmed like any other voice, which is where it belonged all along.
+  // ...and claim-126 CLOSES that hole: everything after it moves down one, so
+  // the map is contiguous 1..14. The EMPTY slot is now 15. STEP 16 stays the
+  // CONFIG MENU and does not shift, because a menu that moves whenever a tool
+  // is retired is a menu nobody can find twice.
+  TOOL_PROB = 5, TOOL_RATCHET = 6, TOOL_POLY = 7, TOOL_MUTE = 8,
+  TOOL_RESLICE = 9, TOOL_ARP = 10, TOOL_DIR = 11, TOOL_GEN = 12,
+  TOOL_SAVE = 13, TOOL_SECTION = 14, TOOL_MENU = 16,
 };
-static constexpr uint16_t TOOLS_IMPLEMENTED = 0xFFFF;
+// Slot 5 (bit 4) is empty since claim-117, so the tool map shows it dark and
+// the latch below refuses it: a key that lights but does nothing is worse than
+// one that does not light.
+static constexpr uint16_t TOOLS_IMPLEMENTED = (uint16_t)(0xFFFF & ~(1u << 14));
 
 static uint8_t  s_tool        = TOOL_NONE;
 static bool     s_menu        = false;
@@ -223,8 +284,29 @@ static uint32_t s_clear_up_ms = 0;
 // then — see the commit site at the bottom of loop().
 static uint8_t  s_pre_committed = 0xFF;
 
+#ifdef SUPEROS_TESTHOOKS
+// G12 (0x45 engine dump): the CLEAR-layer UI state, which lives here rather than
+// in Engine. Tool in the low five bits (TOOL_* is 0..16), menu open in bit 5,
+// tool MAP open in bit 6.
+//
+// Bit 6 added 2026-08-26. The map being open and a tool being latched are
+// DIFFERENT states and only the second was published, so a bare CLEAR hold --
+// which opens the map and deliberately latches nothing -- was indistinguishable
+// from the gesture having done nothing at all. G1 row F14 read that as a FAIL
+// against firmware doing exactly what it is designed to do. An agent that
+// cannot observe a state cannot test it, and this one was unobservable.
+uint8_t superos_ui_state() {
+  return (uint8_t)((s_tool & 0x1F) | (s_menu ? 0x20 : 0)
+                   | (clr.map_open() ? 0x40 : 0));
+}
+#endif
+
 #ifdef SUPEROS_COMBINED
-static constexpr uint8_t EMU_STEP = 8;   // menu step 9: reboot into the emulator
+static constexpr uint8_t EMU_STEP = 8;   // menu step 9: reboot into the OTHER firmware
+// Set while the config menu is being driven from the D650C side (claim-122).
+// The menu itself is identical either way; only step 9 has to know which
+// firmware "the other one" is.
+static bool s_menu_from_emu = false;
 #endif
 
 static inline bool mode_is_write(uint8_t m) {
@@ -254,6 +336,15 @@ static volatile uint8_t  s_half_tick   = 0;      // musical phase in half-ticks,
 static volatile uint8_t  s_k_half      = 0;
 static volatile uint8_t  s_stop_seen   = 0;
 static volatile bool     s_clk_running = false;
+// G10: set while an incoming MIDI clock is driving. The 303 (the reference,
+// claim-019) needs no such flag because it has ONE timebase: its LED phase is
+// the sequencer's own clk_count, so slaving the sequencer slaves the LED by
+// construction. The 808 has TWO, and the second one does not stop: the panel
+// tempo oscillator free-runs whatever the CPU is slaved to (it is one of the
+// two panel lines that are never idle). So on this machine the fix is not only
+// to ADD the MIDI source, it is to MUTE the oscillator, or the phase advances
+// from both and the blink runs at the SUM of the two rates.
+static volatile bool     s_clk_ext     = false;
 
 static inline void half_tick_advance(uint16_t h) {
   s_half_tick = (uint8_t)((s_half_tick + h) % 48);
@@ -261,6 +352,15 @@ static inline void half_tick_advance(uint16_t h) {
 
 // Shared by the ISR and the polled path (call with interrupts off).
 static void clk_track_edge(uint32_t now) {
+  // G10: while an external MIDI clock owns the phase, the panel oscillator's
+  // edges are noise to the indicator and are dropped here rather than at the
+  // call sites, so both the ISR and the polled path are covered by one test.
+  // s_clk_last_us is still stamped: on the way back to internal the first
+  // interval must be a real one, not the whole slaved interval.
+#ifndef G10_BREAK
+  if (s_clk_ext) { s_clk_last_us = now; return; }
+#endif
+
   const uint32_t d = now - s_clk_last_us;
 
   if (s_clk_running) {
@@ -308,6 +408,57 @@ static void clk_track_edge(uint32_t now) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pin-change ISR attribution (testhooks only)
+// ---------------------------------------------------------------------------
+// The stopped blink phase is FROZEN on this machine: 25 samples over 5 s with no
+// MIDI clock gave distinct half_tick values [0] and per_run_us still at its
+// compiled-in 20833, so no edge has ever reached clk_track_edge. The ISR below
+// has three early-outs and a polled read cannot tell which one fires (a polled
+// read cannot see this pulse train at all, L124). These counters separate all
+// five surviving causes in ONE run:
+//
+//   entry == 0 and masked_edge == 0   no edges on PB0-3 at all: physical, or
+//                                     the pins are not inputs
+//   entry == 0 and masked_edge  > 0   edges exist but only ever land while the
+//                                     scan has the mask off: the arming window
+//                                     never coincides with the pulse train
+//   rej_scan  dominates               PORTF never reads idle when the ISR runs
+//   rej_lvl   dominates               the level test rejects: clock_bit is wrong
+//                                     (this machine is UNCALIBRATED, 0x61 flag
+//                                     0x04 clear, so clock_bit is the default 3)
+//   rej_pulse dominates               the COMMON-TRIG crosstalk gate is stuck on
+//
+// pinb_or / pinb_and accumulate PINB & 0x0F at ISR entry, so they name WHICH of
+// the four status lines is actually toggling without running calibration: a bit
+// set in `or` and clear in `and` moved during the window.
+#ifdef SUPEROS_PCINT_ATTRIB
+static volatile uint16_t s_pc_entry       = 0;
+static volatile uint16_t s_pc_rej_scan    = 0;
+static volatile uint16_t s_pc_rej_lvl     = 0;
+static volatile uint16_t s_pc_rej_pulse   = 0;
+// REPLACES s_pc_masked_edge, which was VOID BY CONSTRUCTION and read 0 in all
+// three measured conditions including the one with 106 real edges (L120's
+// recurrence, claim-104). It sampled PCIF0 at re-arm, but the mask above is
+// cleared for the scan and a masked pin does not contribute to PCIF0 at all,
+// so the flag was pinned to zero by a line of this same function.
+//
+// The question it FAILED to answer is worth answering, and this measures it
+// directly: what FRACTION of each loop pass is the ISR masked for? That
+// fraction is the per-edge drop probability for the stopped tempo clock, and
+// via clk_track_edge's period estimate it sets the stopped blink's RATE, not
+// just whether it moves. The handoff asserted ~73% from a scan-length estimate
+// and claim-104 showed that figure cannot be derived from edge counts, because
+// rising and falling edges are sampled at the same duty.
+static volatile uint32_t s_pc_masked_us = 0;     // time with PCMSK0 low bits clear
+static volatile uint32_t s_pc_total_us  = 0;     // total elapsed over the same span
+static volatile uint8_t  s_pc_pinb_or     = 0x00;
+static volatile uint8_t  s_pc_pinb_and    = 0x0F;
+#define PC_BUMP(v)  do { if ((v) < 0x3FFF) ++(v); } while (0)
+#else
+#define PC_BUMP(v)  do { } while (0)
+#endif
+
 // The tempo clock arrives on one of the four PA status lines (AVR PB0-3). Which
 // one is calibrated, so the ISR masks against the live map rather than a fixed
 // bit; all four PCINTs vector here and the level test picks out the clock line.
@@ -317,11 +468,19 @@ void superos_pcint()                    // called from combined.cpp's PCINT0 ISR
 ISR(PCINT0_vect)
 #endif
 {
-  if ((PORTF & 0x0F) != 0x0F) return;   // matrix scan in progress: PB != status
-  if (!(PINB & (uint8_t)(1 << g_panel_map.clock_bit))) return;   // rising only
-  if (eng.PulseActive()) return;        // COMMON-TRIG crosstalk on the status
-                                        // sense: don't feed the tracker a
-                                        // phantom edge either
+#ifdef SUPEROS_PCINT_ATTRIB
+  { const uint8_t pb = (uint8_t)(PINB & 0x0F);
+    PC_BUMP(s_pc_entry); s_pc_pinb_or |= pb; s_pc_pinb_and &= pb; }
+#endif
+  if ((PORTF & 0x0F) != 0x0F) { PC_BUMP(s_pc_rej_scan); return; }  // matrix scan
+                                        // in progress: PB != status
+  if (!(PINB & (uint8_t)(1 << g_panel_map.clock_bit))) {           // rising only
+    PC_BUMP(s_pc_rej_lvl); return;
+  }
+  if (eng.PulseActive()) {              // COMMON-TRIG crosstalk on the status
+    PC_BUMP(s_pc_rej_pulse);            // sense: don't feed the tracker a
+    return;                             // phantom edge either
+  }
   clk_track_edge(micros());
 }
 
@@ -330,6 +489,78 @@ static bool tempo_blink() {
   { const uint8_t sreg = SREG; cli(); t = s_half_tick; SREG = sreg; }
   return t < 24;
 }
+
+#ifdef SUPEROS_TESTHOOKS
+// -DG10_BREAK reverts the three lines of the G10 fix while KEEPING this probe,
+// so the harness can be shown to go red against the exact defect it claims to
+// detect. It is a build flag and never a default: a harness that has only ever
+// been run against a working machine has not been shown to measure anything.
+// claim-097 is why this is not optional here, where a harness passed 12/12 on
+// firmware that was deliberately broken.
+//
+// G10 (0x45 engine dump, testhooks only): the tempo indicator's phase and the
+// source driving it. The shipping image does NOT carry this and must not: it
+// has 287 bytes of headroom and the phase is not something a host needs.
+//
+// This exists because G10 cannot be verified by watching the sequencer. The
+// 303's reference check (claim-019) reads a playhead anchor, which proves the
+// SEQUENCER is locked; on the 808 the sequencer was ALREADY locked and the
+// indicator was the part that was not, so a sequencer-derived observation
+// would have passed against the bug. The phase itself is the only honest
+// channel.
+//
+//   out[0]  s_half_tick, 0..47
+//   out[1]  1 = an external MIDI clock owns the phase
+//   out[2]  what the LED is doing right now (tempo_blink())
+//   out[3..5]  s_per_run in microseconds, 7 bits per byte, little end first
+void superos_blink_state(uint8_t *out) {
+  uint8_t t; uint8_t x; uint32_t per;
+  { const uint8_t sreg = SREG; cli();
+    t = s_half_tick; x = s_clk_ext ? 1 : 0; per = s_per_run; SREG = sreg; }
+  out[0] = (uint8_t)(t & 0x7F);
+  out[1] = x;
+  out[2] = (uint8_t)(t < 24 ? 1 : 0);
+  out[3] = (uint8_t)(per & 0x7F);
+  out[4] = (uint8_t)((per >> 7) & 0x7F);
+  out[5] = (uint8_t)((per >> 14) & 0x7F);
+}
+
+// The counters above, 12 bytes, READ AND CLEARED. Two reads a known interval
+// apart therefore give rates, which is what attributing the frozen phase needs.
+//
+//   out[0..1]   entries          out[6..7]   rejected at PulseActive
+//   out[2..3]   rejected at PORTF        out[8..9]   masked PER MILLE of the pass
+//   out[4..5]   rejected at PINB level   out[10]     PINB&0x0F OR-accumulated
+//                                        out[11]     PINB&0x0F AND-accumulated
+//
+// out[8..9] is 0..1000, or 1001 for "no pass timed yet", which is NOT the same
+// as 0 and must not be shown as one: a zero there would read as "the ISR is
+// never masked", the exact false reassurance the counter it replaced gave.
+#ifdef SUPEROS_PCINT_ATTRIB
+void superos_pcint_counts(uint8_t *out) {
+  uint16_t e, rs, rl, rp; uint8_t po, pa; uint32_t mu, tu;
+  { const uint8_t sreg = SREG; cli();
+    e = s_pc_entry;  rs = s_pc_rej_scan;  rl = s_pc_rej_lvl;
+    rp = s_pc_rej_pulse;
+    mu = s_pc_masked_us;  tu = s_pc_total_us;
+    po = s_pc_pinb_or;    pa = s_pc_pinb_and;
+    s_pc_entry = s_pc_rej_scan = s_pc_rej_lvl = s_pc_rej_pulse = 0;
+    s_pc_masked_us = s_pc_total_us = 0;
+    s_pc_pinb_or = 0x00;  s_pc_pinb_and = 0x0F;
+    SREG = sreg; }
+  // Scaled in 32 bits before the divide: at a 1.4 ms pass this overflows only
+  // past ~4300 s of accumulation, and the dump clears both every read.
+  const uint16_t pm = tu ? (uint16_t)((mu * 1000UL) / tu) : (uint16_t)1001;
+  const uint16_t v[5] = { e, rs, rl, rp, pm };
+  for (uint8_t i = 0; i < 5; ++i) {
+    out[2 * i]     = (uint8_t)(v[i] & 0x7F);
+    out[2 * i + 1] = (uint8_t)((v[i] >> 7) & 0x7F);
+  }
+  out[10] = (uint8_t)(po & 0x0F);
+  out[11] = (uint8_t)(pa & 0x0F);
+}
+#endif
+#endif
 
 // --- external MIDI clock sync ----------------------------------------------
 static const uint16_t MCLK_TIMEOUT_MS = 300;
@@ -380,11 +611,51 @@ static void usb_shutdown_hw() {
 void panel_map_boot_load() {
   flash_persist_begin();
   load_panel_map(g_panel_map);
+  // Settings too, because BOTH firmwares need one of them: the emulator honours
+  // g_settings.clock_source exactly as the sequencer does, so the config menu's
+  // MIDI/INTERNAL choice (step 5) governs the emulated machine as well. Without
+  // this the emulator ran on a default-constructed Settings and there was no way
+  // to tell it to ignore an incoming MIDI clock.
+  load_settings(g_settings);
 }
 
+#ifdef SUPEROS_LOOP_ACCT
+// claim-085 Phase 1 conditions 3a and 4. Definitions for the externs in
+// loop_acct.h; see that header for why the ladder injects sleep instead of
+// burning it, and for the tick source's resolution and range.
+volatile uint16_t g_la_ovf         = 0;
+volatile uint32_t g_la_sleep_ticks = 0;
+volatile uint32_t g_la_scan_passes = 0;
+volatile uint32_t g_la_deb_passes  = 0;
+uint32_t g_la_arm_ticks  = 0;
+uint16_t g_la_ladder_us  = 0;
+uint8_t  g_la_deb_div    = 1;
+uint8_t  g_la_deb_phase  = 0;
+uint8_t  g_la_status     = 0;
+
+ISR(TIMER3_OVF_vect) { ++g_la_ovf; }
+#endif
+
 void setup() {
+#ifdef SUPEROS_LOOP_ACCT
+  la_init();                     // Timer3 free-running at clk_IO/8, before anything
+                                 // else can read the clock. Nothing in this
+                                 // firmware writes any TCCRn, so this is the only
+                                 // owner of Timer3 in the build.
+#endif
 #ifndef SUPEROS_USB_MIDI
   usb_shutdown_hw();
+#endif
+  midi_usb_init();               // register the USB SysEx handler (no-op sans USB)
+#if defined(SUPEROS_USB_MIDI) && !defined(SUPEROS_COMBINED)
+  // VBUS gate (usb_sof.h): the core's usb_init ran pre-main with the engine
+  // live; park it detached+frozen, then let the gate attach it right back if a
+  // cable is already present. Unplugged, the USB engine clock never runs (a
+  // live engine measurably corrupts the high-impedance panel matrix).
+  // Combined builds do this in combined.cpp instead.
+  UDCON  |= _BV(DETACH);
+  USBCON |= _BV(FRZCLK);
+  usb_vbus_gate();
 #endif
   // Pull up the MIDI RX line so an unplugged jack can't leave the input floating
   // and self-clock the UART from matrix/EMI noise — spurious 0xF8 bytes would
@@ -394,9 +665,16 @@ void setup() {
   hw::Init();
   eng.Init();
 
-  panel_map_boot_load();         // mount the store + decode table, before any read
+  panel_map_boot_load();         // mount the store + decode table + settings
   load_all(eng);
-  load_settings(g_settings);
+#ifdef SUPEROS_COMBINED
+  // Came back from the emulator on a CLEAR double-press: open the config menu,
+  // which is where that gesture leads on this side too. One-shot.
+  if (eeprom_read_byte(EE_MENU_ON_BOOT) == EE_MENU_ON_BOOT_VAL) {
+    eeprom_update_byte(EE_MENU_ON_BOOT, 0xFF);
+    s_menu = true;
+  }
+#endif
 
   eng.SetIndicators(eng.live_variation(), false);
 
@@ -427,44 +705,64 @@ void setup() {
 // switch for Step #12"). A CLEAR tap with no step commits the PRE SCALE alone
 // (OM p.13). TAP writes the step that is playing right now.
 static void handle_pattern_write(uint8_t inst) {
-  if (s_tool != TOOL_SECTION)
+  // The MODE dial owns the section, but ONLY WHEN IT MOVES -- the same rule the
+  // BASIC VARIATION dial already follows, and for the same reason (claim-120).
+  //
+  // Asserting it on every pass made sections 3 and 4 REACHABLE BUT UNEDITABLE.
+  // The SECTION tool can select any of the four, but the step keys edit steps
+  // only while NO tool is latched, and the instant the tool was released this
+  // line snapped the display back to section 0 or 1 on the very next pass. So
+  // the two extended sections could be looked at and never written to, which is
+  // how a feature reads as broken while every part of it works.
+  //
+  // Now the dial takes the section back when the operator turns it, and the
+  // SECTION tool's choice survives until then.
+  static uint8_t s_mode_sec_ref = 0xFF;
+  if (s_tool != TOOL_SECTION && modeVal != s_mode_sec_ref) {
+    s_mode_sec_ref = modeVal;
     disp_section = (modeVal == MODE_2ND_PART) ? 1 : 0;
+  }
 
   // A step press landing just after a CLEAR hold is almost always a late
   // tool-map press, not a step entry — swallow it.
   const bool grace = (uint32_t)(millis() - s_clear_up_ms) < 250;
 
-  if (clearB.held()) {
-    // STEP NUMBER: set this part's length, and commit the prescale with it.
-    for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
-      if (!stepB[b].rising()) continue;
-      clr.chorded = true;
-      eng.SetSectionLength(disp_section, (uint8_t)(b + 1));
-      eng.CommitPrescale(preVal);
-      s_pre_committed = preVal;    // the dial is now what the pattern holds
-      midi_send_layout_update(eng.cur_pat);
-    }
-    return;                       // CLEAR held: no step editing this pass
-  }
+  // The stock CLEAR+step chord (STEP NUMBER) lived here until claim-132: the
+  // tool map now owns CLEAR from the press, the dispatcher freezes this
+  // handler whenever CLEAR is down, and the chord's function lives in the
+  // LENGTH tool. The dead block is gone rather than left to mislead.
 
   for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
     if (!stepB[b].rising() || grace) continue;
+    // A press in a part that does not exist yet CREATES it (claim-133, "i
+    // cant write any steps when in 2nd part mode"): a fresh pattern has
+    // seclen [16,0,0,0], so 2ND PART -- and any section the SECTION tool can
+    // show (claim-120) -- was all-dark and pressed like a dead panel. The
+    // stock machine's 2ND PART write is how a 32-step rhythm comes to exist
+    // at all, so the first press extends every zero section up to the shown
+    // one to the full 16 and then lands normally. LENGTH and PATTERN CLEAR
+    // take it back.
+    if (eng.SectionLength(disp_section) == 0) {
+      for (uint8_t s2 = 0; s2 <= disp_section; ++s2)
+        if (eng.SectionLength(s2) == 0) eng.SetSectionLength(s2, NUM_STEP_BTNS);
+      midi_send_layout_update(eng.cur_pat);
+    }
     const uint8_t s = (uint8_t)(disp_section * NUM_STEP_BTNS + b);
     if (b >= eng.SectionLength(disp_section)) continue;   // outside this part
+    // Past this VOICE's own loop length, by the same predicate the display uses
+    // (claim-112). The step is dark because the voice can never read it, so a
+    // press there would be an edit with no visible and no audible result: the
+    // machine would silently accumulate hits nobody asked for. Existing steps
+    // are still kept, which is why this blocks the PRESS and not the record.
+    if (!eng.step_in_inst_loop(inst, s)) continue;
     eng.ToggleStep(inst, s);
     midi_send_step_update(eng.cur_pat, inst, s, eng.cur().step_get(inst, s));
   }
 
   if (eng.running) {
-    // Chase-delete: while CLEAR is HELD past the hold threshold, erase this
-    // instrument's steps as the chase light passes them.
-    if (clr.hold_seen && clearB.held() && eng.step_advanced && eng.step >= 0) {
-      const uint8_t cs = (uint8_t)eng.step;
-      if (eng.cur().step_get(inst, cs)) {
-        eng.ClearStep(inst, cs);
-        midi_send_step_update(eng.cur_pat, inst, cs, false);
-      }
-    }
+    // Chase-delete MOVED to PATTERN CLEAR mode (claim-129). Holding CLEAR in a
+    // write mode is the tool-map chord, and one key cannot both open the map
+    // and erase what is playing underneath it.
     // TAP programming (OM p.13): record the step that is playing right now.
     if (tapB.rising() && eng.step >= 0) {
       eng.SetStep(inst, (uint8_t)eng.step);
@@ -539,7 +837,16 @@ static uint16_t s_occ_mask = 0;
 static uint8_t  s_occ_var  = 0xFF;   // variation the mask was built for; 0xFF = stale
 static uint32_t s_occ_ms   = 0;
 
-static void occ_rebuild(uint8_t var) {
+// noinline, and it buys more than it looks. This is a `static void` called only
+// from superos_loop, so gcc inlined it -- and brought its 228-byte Pattern into
+// superos_loop's frame, which is THE ROOT OF EVERY CHAIN ON THIS MACHINE.
+// superos_loop measured 256 B and 228 of that was this one local, carried by
+// paths that never open the PATTERN CLEAR display: the SysEx handler, the flash
+// store, the layout mirror, all of them paying for a buffer used once a second
+// in one mode. Out of line it costs its 231 B on its own chain and 28 on
+// everybody else's (claim-080; the walker had to learn `ijmp` before any of this
+// was visible).
+static __attribute__((noinline)) void occ_rebuild(uint8_t var) {
   uint16_t m = 0;
   for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
     Pattern t;
@@ -556,6 +863,25 @@ static void occ_rebuild(uint8_t var) {
 static void handle_pattern_clear_mode() {
   for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
     if (stepB[b].rising()) eng.SetEditSlot(b);
+
+  // RUNNING: holding CLEAR erases the SELECTED VOICE's steps as the chase light
+  // passes them, the 606's live-erase (claim-129). This is where it belongs:
+  // PATTERN CLEAR is the mode whose whole job is erasing, and it is the one
+  // mode with no tool map competing for a CLEAR hold.
+  //
+  // STOPPED it behaves as it always did -- a CLEAR tap erases the whole slot,
+  // which is the stock gesture and the one the D650C side gives you.
+  if (eng.running && clr.hold_seen && clearB.held() &&
+      eng.step_advanced && eng.step >= 0) {
+    const uint8_t cs = (uint8_t)eng.step;
+    const uint8_t inst = instVal % NUM_INSTRUMENTS;
+    if (eng.cur().step_get(inst, cs)) {
+      eng.ClearStep(inst, cs);
+      midi_send_step_update(eng.cur_pat, inst, cs, false);
+    }
+    clr.chorded = true;        // an erase gesture, not a pending whole-slot tap
+  }
+
   if (clr.tap) {
     clr.tap = false;
     eng.ClearPatternSlot(eng.sel_slot, varVal);
@@ -626,17 +952,6 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       }
       if (tapB.rising()) s_ilen_phase = !s_ilen_phase;
       break;
-    case TOOL_PRESCALE:
-      // Steps 1-4 set the PRE SCALE outright; the LED frame shows which one the
-      // pattern holds. Marking the dial as committed keeps a later CLEAR tap
-      // from undoing this with whatever detent the dial is resting on.
-      for (uint8_t b = 0; b < 4; ++b)
-        if (stepB[b].rising()) {
-          eng.CommitPrescale(b);
-          s_pre_committed = preVal;
-          midi_send_layout_update(eng.cur_pat);
-        }
-      break;
     case TOOL_COPY:   // 1 clear / 2 copy / 3 paste, the 606's layout
       if (stepB[0].rising()) { eng.ClearPattern(eng.cur_pat); midi_send_pattern_dump(eng.cur_pat); }
       if (stepB[1].rising())   eng.CopyPatternToBuf();
@@ -650,14 +965,6 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       if (stepB[0].rising() || stepB[1].rising() || stepB[2].rising() || stepB[3].rising())
         midi_send_pattern_dump(eng.cur_pat);
       break;
-    case TOOL_ACCENT:
-      for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
-        if (stepB[b].rising()) {
-          const uint8_t s = (uint8_t)(sec * NUM_STEP_BTNS + b);
-          eng.ToggleStep(INST_AC, s);
-          midi_send_step_update(eng.cur_pat, INST_AC, s, eng.cur().step_get(INST_AC, s));
-        }
-      break;
     // PROBABILITY and RATCHET are two-phase, and both take TAP where the 606
     // takes CLEAR: on this machine CLEAR is the gateway key, so a tap inside a
     // tool exits it and cannot also mean "wipe". TAP is free in every tool here.
@@ -669,8 +976,11 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       // Step 16 used to pass 16 straight into prob_set, where it overflowed the
       // instrument nibble: the press looked dead and cost a slot. See prob_set.
       if (s_prob_sel == 0xFF) {
-        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
-          if (stepB[b].rising()) { s_prob_sel = (uint8_t)(sec * NUM_STEP_BTNS + b); break; }
+        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
+          const uint8_t s = (uint8_t)(sec * NUM_STEP_BTNS + b);
+          if (!eng.step_in_inst_loop(inst, s)) break;   // dark: not selectable
+          if (stepB[b].rising()) { s_prob_sel = s; break; }
+        }
         if (tapB.rising()) {
           eng.cur().prob_clear_inst(inst);
           eng.mark_pat_dirty(eng.cur_pat);
@@ -700,8 +1010,11 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       // Key 1 used to mean 2x, so there was no key that put a step back to one
       // hit: "clearing" a ratcheted step re-armed it and it kept double-firing.
       if (s_ratchet_sel == 0xFF) {
-        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
-          if (stepB[b].rising()) { s_ratchet_sel = (uint8_t)(sec * NUM_STEP_BTNS + b); break; }
+        for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
+          const uint8_t s = (uint8_t)(sec * NUM_STEP_BTNS + b);
+          if (!eng.step_in_inst_loop(inst, s)) break;   // dark: not selectable
+          if (stepB[b].rising()) { s_ratchet_sel = s; break; }
+        }
         if (tapB.rising()) {
           eng.cur().ratchet_clear_inst(inst);
           eng.mark_pat_dirty(eng.cur_pat);
@@ -754,10 +1067,25 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
             eng.SetInstPoly(b, !eng.GetInstPoly(b));
             midi_send_pattern_dump(eng.cur_pat);
           }
-        if (!eng.running && (stepB[14].rising() || stepB[15].rising())) {
-          eng.ApplyMasterPoly(stepB[15].rising());
-          save_dirty(eng);
-          for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
+        // STEP 16 TOGGLES master polymeter and its LED shows the STATE, not a
+        // label (claim-117): one key answers "is it on?" and changes it. STEP
+        // 15 stays the explicit "all voices back to bar-reset", which a toggle
+        // cannot express in one press from an unknown state.
+        //
+        // BOTH WORK WHILE PLAYING (claim-118). The engine applies the musical
+        // half in RAM at once and owes the store patch until the transport
+        // stops, so the machine answers the press without a flash write landing
+        // under the clock. The bulk re-dump waits with it: 32 dumps would flood
+        // the TX ring mid-measure, and the pattern the player can actually hear
+        // is the one that matters now.
+        if (stepB[14].rising() || stepB[15].rising()) {
+          eng.ApplyMasterPoly(stepB[15].rising() ? !eng.master_poly : false);
+          if (eng.running) {
+            midi_send_pattern_dump(eng.cur_pat);
+          } else {
+            save_dirty(eng);
+            for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
+          }
         }
       }
       if (tapB.rising()) s_ilen_phase = !s_ilen_phase;
@@ -775,7 +1103,7 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
     case TOOL_RESLICE: {
       uint8_t win = 0;
       for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) if (stepB[b].held()) { win = (uint8_t)(b + 1); break; }
-      if (win) eng.ResliceOn(win); else eng.ResliceOff();
+      eng.ResliceOn(win);            // win 0 is off
       break;
     }
     case TOOL_ARP:
@@ -784,7 +1112,24 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       if (stepB[15].rising()) eng.ArpClear();
       break;
     case TOOL_DIR:
-      for (uint8_t b = 0; b < 4; ++b) if (stepB[b].rising()) eng.play_dir = b;
+      // Two phases on TAP, the same sticky per-voice mode LENGTH and POLY use,
+      // because "TAP then a value" already means "for THIS voice" in both of
+      // them and a third meaning here would be a third thing to remember.
+      //
+      // MASTER (STEP 16 lit): steps 1-4 set the pattern's direction.
+      // VOICE (display blinking): steps 1-4 set the SELECTED voice's own
+      // direction, overriding the master. Pressing the direction the voice
+      // already has clears the override, so the same key that sets it also
+      // hands the voice back -- the gesture LENGTH uses to clear a voice
+      // length, kept identical on purpose.
+      if (s_ilen_phase) {
+        for (uint8_t b = 0; b < 4; ++b)
+          if (stepB[b].rising())
+            eng.SetInstDir(inst, eng.GetInstDir(inst) == b ? 0xFF : b);
+      } else {
+        for (uint8_t b = 0; b < 4; ++b) if (stepB[b].rising()) eng.SetPlayDir(b);
+      }
+      if (tapB.rising()) s_ilen_phase = !s_ilen_phase;
       break;
     case TOOL_GEN:
       for (uint8_t b = 0; b < 4; ++b)
@@ -809,20 +1154,15 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
   if (s_pre_ref != 0xFF && preVal != s_pre_ref) {
     s_pre_ref = preVal;
     if (tool == TOOL_SECTION) disp_section = preVal;
-    // The PRESCALE tool also follows the dial, so it doubles as the live
-    // readout of the PRE SCALE decode: turn to detent n and step LED n lights.
-    // That is the check to run against docs/HARDWARE_MAP.md if the dial ever
-    // looks rotated again (see PanelMap::pre_code).
-    if (tool == TOOL_PRESCALE) {
-      eng.CommitPrescale(preVal);
-      s_pre_committed = preVal;
-      midi_send_layout_update(eng.cur_pat);
-    }
+    // The live PRE SCALE readout that the retired PRESCALE tool provided (turn
+    // to detent n, step LED n lights) is the check to run against
+    // docs/HARDWARE_MAP.md if the dial ever looks rotated again. It now lives
+    // in LENGTH, which is the tool PRE SCALE folded into.
   }
 }
 
 // ---------------------------------------------------------------------------
-// Config menu (double-tap CLEAR)
+// Config menu (CLEAR held + TAP, or the tool map's STEP 16)
 // ---------------------------------------------------------------------------
 // Settings changed here are flushed to flash once the menu closes (see the
 // s_settings_dirty site in loop()). The menu itself only edits RAM: the panel
@@ -848,7 +1188,10 @@ static void handle_config_menu() {
     s_settings_dirty = true;
     midi_send_settings();
   }
-  if (stepB[6].rising() && !eng.running) eng.ApplyMasterPoly(!eng.master_poly);
+  // Master polymeter is NOT here any more (claim-117). It was in two places at
+  // once, and the POLY tool is the one that can show its state next to the
+  // per-voice switches it applies to; a duplicate in a menu that shows a bare
+  // lamp could only disagree with it.
   if (stepB[7].rising()) midi_start_panel_calibration();
 #ifdef SUPEROS_COMBINED
   // Step 9 boots the emulator, right now — the same thing SysEx 0x4D does, and
@@ -858,11 +1201,19 @@ static void handle_config_menu() {
   // trip; it is not one-way any more, because the emulator answers a CLEAR
   // double-press by coming back here (see emu_avr.cpp).
   if (stepB[EMU_STEP].rising()) {
+    // "the OTHER firmware", not "the emulator": since claim-122 this same menu
+    // is reachable from INSIDE the emulator, where booting the emulator again
+    // would be a reboot into where you already are.
     save_dirty(eng);
-    combined_switch_firmware(FW_D650);        // does not return
+    combined_switch_firmware(s_menu_from_emu ? FW_SUPEROS : FW_D650);  // no return
   }
 #endif
-  if (stepB[15].rising()) { s_menu = false; s_menu_hold = true; }
+  // TAP is BACK, and back is never OUT: only PATTERN CLEAR leaves the menu.
+  // The menu is flat today, so there is no level above this one to return to
+  // and this is deliberately a no-op -- written down rather than left out, so
+  // that adding a submenu has an obvious place to hook and cannot accidentally
+  // reintroduce a TAP exit. STEP 16 used to close the menu and no longer does.
+  if (tapB.rising()) { /* back: no level above the root yet */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -876,15 +1227,11 @@ static uint16_t build_frame(uint8_t mode, uint8_t inst) {
     // Stock priority display (OM p.11): the rhythm that will play first FLASHES,
     // the other selected one stays lit. Arming an INTRO with TAP moves the flash
     // from the basic rhythm to the INTRO/FILL IN button.
-    const uint8_t basic = eng.sel_slot;
-    const uint8_t fill  = eng.fill_slot;
-    const bool    fill_first = eng.intro_armed || eng.FillPlaying();
-    const uint8_t flashing = fill_first ? fill : basic;
-    const uint8_t steady   = fill_first ? basic : (eng.intro_armed ? fill : 0xFF);
-    if (steady != 0xFF) f |= led_bit(steady);
-    const bool on = eng.running ? eng.BeatBlink() : tempo_blink();
-    if (on) f |= led_bit(flashing);
-    return f;
+    // The row itself is Engine::play_row (claim-115): it has to be reachable
+    // from the host harness, which cannot link main.cpp. Only the blink SOURCE
+    // is decided here, because it is a main.cpp concern -- the beat while
+    // running, the tempo LED's own phase while stopped.
+    return eng.play_row(eng.running ? eng.BeatBlink() : tempo_blink());
   }
 
   if (mode == MODE_COMPOSE) {
@@ -915,6 +1262,10 @@ static uint16_t build_frame(uint8_t mode, uint8_t inst) {
   const uint8_t plen = eng.SectionLength(disp_section);
   for (uint8_t b = 0; b < plen && b < NUM_STEP_BTNS; ++b) {
     const uint8_t s = (uint8_t)(disp_section * NUM_STEP_BTNS + b);
+    // A voice with its own loop length never reads past it, so lighting those
+    // steps advertises hits that cannot sound (claim-112). `s` only climbs, so
+    // the first one out of the loop ends the row.
+    if (!eng.step_in_inst_loop(inst, s)) break;
     if (eng.cur().step_get(inst, s)) f |= led_bit(b);
   }
   if (eng.chase_lit()) {
@@ -926,7 +1277,11 @@ static uint16_t build_frame(uint8_t mode, uint8_t inst) {
 
 static uint16_t build_map_frame() {
   uint16_t f = TOOLS_IMPLEMENTED;
-  if (s_tool != TOOL_NONE) f ^= led_bit((uint8_t)(s_tool - 1));
+  // The latched tool BLINKS (claim-126). It used to be XORed out of a map where
+  // everything else is lit, so choosing a tool turned its key OFF -- the one key
+  // you had just picked became the only dark one, which reads as "unavailable"
+  // rather than "selected".
+  if (s_tool != TOOL_NONE && !tempo_blink()) f &= (uint16_t)~led_bit((uint8_t)(s_tool - 1));
   return f;
 }
 
@@ -955,13 +1310,10 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
       if (L) f = led_bit((uint8_t)(L - 1));
       break;
     }
-    case TOOL_PRESCALE: f = led_bit(eng.cur().prescale & 3); break;
+    // TOOL_MENU never latches (the tool-map handler opens the menu instead), so
+    // it has no tool frame; build_menu_frame owns the display from then on.
     case TOOL_COPY:     f = 0x0003; break;
     case TOOL_XFORM:    f = 0x0007; break;
-    case TOOL_ACCENT:
-      for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
-        if (eng.cur().step_get(INST_AC, (uint8_t)(sec * NUM_STEP_BTNS + b))) f |= led_bit(b);
-      break;
     // PROBABILITY / RATCHET, both phases. Pick shows the voice's PATTERN with
     // the affected steps blinking on top, so you can see what you are aiming at;
     // set shows the current VALUE as a bar, so the tool says what it is holding
@@ -973,6 +1325,11 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
         uint16_t pm = 0;
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
           const uint8_t s = (uint8_t)(sec * NUM_STEP_BTNS + b);
+        // Past this voice's own loop length the step can never sound, so it
+        // must not be shown and must not be selectable (claim-112, extended to
+        // these two tools in claim-121). `s` only climbs, so the first one out
+        // ends the row.
+          if (!eng.step_in_inst_loop(inst, s)) break;
           if (p.step_get(inst, s)) f |= led_bit(b);
           if (p.prob_get(inst, s)) pm |= led_bit(b);
         }
@@ -991,6 +1348,11 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
         uint16_t rm = 0;
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b) {
           const uint8_t s = (uint8_t)(sec * NUM_STEP_BTNS + b);
+        // Past this voice's own loop length the step can never sound, so it
+        // must not be shown and must not be selectable (claim-112, extended to
+        // these two tools in claim-121). `s` only climbs, so the first one out
+        // ends the row.
+          if (!eng.step_in_inst_loop(inst, s)) break;
           if (p.step_get(inst, s)) f |= led_bit(b);
           if (p.ratchet_get(inst, s)) rm |= led_bit(b);
         }
@@ -1018,14 +1380,28 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
         break;
       }
       f = (uint16_t)(eng.cur().poly & 0x0FFF);
-      if (!eng.running) f |= led_bit(14) | led_bit(15);
+      f |= led_bit(14);                                // 15: all to bar-reset
+      if (eng.master_poly) f |= led_bit(15);           // 16: master polymeter ON
       break;
     case TOOL_MUTE:    f = (uint16_t)(eng.mute_mask & 0x0FFF); break;
-    case TOOL_RESLICE: f = eng.reslice_on ? led_bit((uint8_t)(eng.reslice_len - 1)) : 0; break;
+    case TOOL_RESLICE: f = eng.ResliceActive() ? led_bit((uint8_t)(eng.ResliceWindow() - 1)) : 0; break;
     case TOOL_ARP:
       for (uint8_t i = 0; i < eng.arp_len && i < NUM_STEP_BTNS; ++i) f |= led_bit(i);
       break;
-    case TOOL_DIR:     f = led_bit(eng.play_dir & 3); break;
+    case TOOL_DIR:
+      if (s_ilen_phase) {
+        // Voice mode blinks at the beat, like the other per-voice phases. A
+        // voice with NO override still shows a direction -- the master's -- so
+        // the display answers "what is this voice doing" rather than going
+        // blank and leaving the player to infer it.
+        if (eng.running ? eng.BeatBlink() : tempo_blink())
+          f = led_bit((uint8_t)((eng.InstDirOverridden(inst)
+                                 ? eng.GetInstDir(inst) : eng.play_dir) & 3));
+      } else {
+        f = led_bit(eng.play_dir & 3);
+        f |= led_bit(15);            // STEP 16 lit = this is the MASTER phase
+      }
+      break;
     case TOOL_GEN:     f = 0x000F; break;
     case TOOL_SAVE:    f = eng.running ? 0 : 0x0001; break;
     case TOOL_SECTION: f = led_bit(sec); break;
@@ -1040,37 +1416,174 @@ static uint16_t build_menu_frame() {
   f |= led_bit(g_settings.midi_channel == 0 ? 0 : 1);
   if (g_settings.clock_source == CLK_SRC_INTERNAL) f |= led_bit(4);
   if (g_settings.out_mode == OUT_MODE_THRU)        f |= led_bit(5);
-  if (eng.master_poly)                             f |= led_bit(6);
   if (midi_calibration_active())                   f |= led_bit(7);
 #ifdef SUPEROS_COMBINED
-  f |= led_bit(EMU_STEP);
+  // STEP 9 switches to the OTHER firmware, and BLINKS while the menu is being
+  // driven from the D650C side, so the key says which machine you are
+  // standing in as well as what it does. The blink rides millis(), NOT
+  // tempo_blink(): the D650C menu takeover pauses the emulated machine and
+  // with it the tempo phase, so the "blink" froze at whatever level the
+  // phase held and the player read a solid (or dark) key (claim-133,
+  // "in d650c mode, 9 should be blinking").
+  if (!s_menu_from_emu || ((millis() >> 8) & 1)) f |= led_bit(EMU_STEP);
 #endif
-  f |= led_bit(15);                                 // exit
-  if (!tempo_blink()) f &= (uint16_t)~led_bit(15);  // blink the exit key
+  // No exit key is drawn any more: PATTERN CLEAR is the only way out
+  // (claim-116), and STEP 16 blinking as "exit" would now be a lie the panel
+  // tells. Removing the light is the honest half of removing the function.
   return f;
 }
 
+#ifdef SUPEROS_COMBINED
+// Run the config menu FROM THE D650C SIDE, without rebooting (claim-122).
+//
+// Before this, the only way to reach the menu from the emulator was
+// combined_switch_firmware(), which is a watchdog reset: it tore down USB,
+// restarted the machine and came back in the other firmware. That is a lot of
+// ceremony for changing a MIDI channel, and it means the emulator's state has
+// to survive a reboot to feel continuous.
+//
+// It BLOCKS, and that is the honest design rather than a shortcut. The
+// emulator's interpreter is not advanced while this runs, so the emulated
+// machine is paused: its tempo stops, and it resumes exactly where it was. A
+// non-blocking version would have to interleave two owners of PORTF -- the
+// emulated CPU drives the LED rows and selects through hook_port, this drives
+// them through hw::ScanAndDisplay -- and two owners of one port is how you get
+// a display that flickers between two programs. Pausing is what makes the
+// panel unambiguous.
+//
+// Pin-change interrupts are masked throughout: they vector to emu_pcint, which
+// would be sampling a matrix this function is driving, and would feed the
+// emulated machine's clock estimate garbage taken during someone else's scan.
+void superos_menu_takeover() {
+  extern uint8_t g_led_dwell_us;   // SysEx 0x3F live-tunable LED dwell
+  const uint8_t saved_mask = PCMSK0;
+  PCMSK0 &= (uint8_t)~(_BV(PCINT0) | _BV(PCINT1) | _BV(PCINT2) | _BV(PCINT3));
+
+  s_menu_from_emu = true;
+  uint16_t frame = 0;
+  // The emulated machine KEEPS PLAYING while the menu is up (claim-127): the
+  // player asked to be able to open this without the sequencer stopping. Its
+  // panel I/O is suspended by emu_panel_borrow(), so PORTF is ours alone, but
+  // its instrument data and COMMON TRIG are on other pins and are untouched.
+  extern void emu_loop();
+
+  // Require CLEAR to be RELEASED before an exit can be recognised. The gesture
+  // that opened the menu (CLEAR held + TAP) leaves CLEAR down, and the exit is
+  // a CLEAR tap, so without this the menu would open and close on one press.
+  bool armed = false;
+
+  for (;;) {
+    wdt_reset();                   // this loop owns the machine; keep it fed
+    hw::ScanAndDisplay(frame, panel.cell, &panel.status_hi, g_led_dwell_us);
+
+    for (uint8_t i = 0; i < NUM_STEP_BTNS; ++i) stepB[i].push(panel.step(i));
+    clearB.push(panel.clear());
+    tapB.push(panel.tap());
+
+    const uint32_t now_ms = millis();
+    clr.update(clearB, now_ms);
+
+    if (!clearB.held()) armed = true;
+    if (armed && clr.tap) { clr.tap = false; break; }   // PATTERN CLEAR exits
+
+    handle_config_menu();          // may not return (step 9 switches firmware)
+    frame = build_menu_frame();
+    emu_loop();                    // keep the emulated machine in time
+  }
+
+  PORTF = 0x0F;                    // park the matrix for whoever drives next
+  s_menu_from_emu = false;
+  PCIFR  = _BV(PCIF0);             // drop edges this function's own scan made
+  PCMSK0 = saved_mask;
+}
+#endif
+
+// The scan's between-column hook (claim-128). One line, and it is the whole
+// point of the hook: the trigger data window has to close on time, not at the
+// end of whatever the loop is doing, or the shared VARIATION lamp line picks up
+// the loop's jitter as visible flicker.
+void scan_tick() { eng.EndPulseIfDue(); }
+
 // ---------------------------------------------------------------------------
 void loop() {
+#ifdef SUPEROS_LOOP_ACCT
+  // The ladder's sleep rung, at the TOP because loop() has early returns (the
+  // config-menu path at section 5b) and the bottom is therefore not a single
+  // exit. For a duty ratio the position within the pass is irrelevant; having
+  // exactly ONE site is not.
+  la_ladder_sleep();
+#endif
   const uint32_t now_ms = millis();
+
+#if defined(SUPEROS_USB_MIDI) && !defined(SUPEROS_COMBINED)
+  usb_vbus_gate();   // USB engine runs only while a USB-C cable is present
+#endif
 
   // 1. One combined matrix-scan + LED-display pass (~1 ms; the loop heartbeat).
   // The clock-pulse interrupt is masked during the pass: the status lines hop
   // levels as the selects toggle, and those fake edges would poison the tempo
   // estimate.
+#ifdef SUPEROS_PCINT_ATTRIB
+  // Both stamps come from ONE micros() read so the masked span can never be
+  // charged time the pass did not spend, and the pass total is measured from
+  // the same instant every pass rather than from the mask's own edges.
+  const uint32_t pc_t0 = micros();
+  { static uint32_t s_pc_prev_us = 0;
+    if (s_pc_prev_us) s_pc_total_us += pc_t0 - s_pc_prev_us;
+    s_pc_prev_us = pc_t0; }
+#endif
+#ifndef PCINT_POSCTL
   PCMSK0 &= (uint8_t)~(_BV(PCINT0) | _BV(PCINT1) | _BV(PCINT2) | _BV(PCINT3));
+#endif
   {
     extern uint8_t g_led_dwell_us;   // SysEx 0x3F live-tunable LED dwell
     hw::ScanAndDisplay(frame, panel.cell, &panel.status_hi, g_led_dwell_us);
   }
+#ifdef SUPEROS_LOOP_ACCT
+  // Condition 4's DENOMINATOR. NOT a number expected to fall: ScanAndDisplay
+  // multiplexes the LED display and is not eliminable, only its rate is
+  // negotiable, so a flat scan count is not a failed refactor (CORE's own
+  // correction to the condition's wording).
+  la_count_scan();
+#endif
+#ifdef SUPEROS_TESTHOOKS
+  // G12 panel inject (0x4B), applied here and nowhere else: after the real scan,
+  // before the debouncers, so an injected press goes through the same decode
+  // table, debounce and gesture timing a finger does. Everything below this line
+  // -- including midi_set_probe, so 0x3B reads back what was injected -- cannot
+  // tell the difference, which is the point.
+  midi_panel_inject(panel.cell, panel.status_hi);
+#endif
   delayMicroseconds(8);              // let the status gate settle after the
                                      // selects restore, before we re-arm
   PCIFR  = _BV(PCIF0);               // drop edge noise from the scan itself
   PCMSK0 |= _BV(PCINT0) | _BV(PCINT1) | _BV(PCINT2) | _BV(PCINT3);
+#ifdef SUPEROS_PCINT_ATTRIB
+  s_pc_masked_us += micros() - pc_t0;
+#endif
   midi_set_probe(panel.cell, panel.status_hi);   // feeds the 0x3B probe and the
                                                  // calibration stream
 
   // 2. Debounce everything.
+#ifdef SUPEROS_LOOP_ACCT
+  // Condition 4's NUMERATOR, and the decimation rung of the ladder. The block
+  // bracketed here is exactly CORE's section 2: the six debouncer pushes (16
+  // step buttons, CLEAR, TAP, the FILL IN pedal, RUN, the tempo clock) plus the
+  // five dial reads, which is the work an event-driven dispatcher would skip on
+  // a pass where nothing changed.
+  //
+  // THE CAVEAT THAT MAKES A DECIMATED RUN VALID ONLY AT REST, stated where the
+  // code is because it is not obvious: PinState::rising() is a fixed 3-bit
+  // pattern test on a shift register (`(state & 0x07) == 0x03`, line 103). A
+  // skipped push does not clear an edge, it FREEZES it, so a key that is
+  // actually down re-fires rising() once per skipped pass. With nothing pressed
+  // and the dials at rest the whole block is inert and decimating it changes
+  // nothing, which is the condition the host tool runs the decimation rung
+  // under. The one input that is never at rest is the free-running tempo clock,
+  // and decimating clkB only changes the rate of the 0xF8 this pass emits.
+  // A DECIMATED RUN IS AN INSTRUMENT CALIBRATION, NOT A PLAYABLE MACHINE.
+  if (la_debounce_due()) {
+#endif
   for (uint8_t s = 0; s < NUM_STEP_BTNS; ++s) stepB[s].push(panel.step(s));
   clearB.push(panel.clear());
   tapB.push(panel.tap());
@@ -1090,6 +1603,9 @@ void loop() {
   preVal  = panel.prescale(preVal);
   varVal  = panel.variation(varVal);
   fillVal = panel.fill_every(fillVal);
+#ifdef SUPEROS_LOOP_ACCT
+  }
+#endif
 
   const uint8_t mode = modeVal;
   const uint8_t inst = instVal % NUM_INSTRUMENTS;
@@ -1118,6 +1634,25 @@ void loop() {
   // 3b. Drain MIDI IN early so an external clock/transport can drive this pass.
   MidiClockIn mc;
   midi_rx_poll(eng, mc);
+  eng.EndPulseIfDue();   // claim-128: the drain is the tail's long pole
+
+  // 3c. Apply any pending A<->B layout mirror. HERE, and not where it is asked
+  // for, is the whole of claim-080's remaining fix: the copy needs a 228-byte
+  // record buffer, and asking for it from handle_sysex -> SelectSlot ->
+  // latch_prescale put that buffer 235 bytes deep on the SysEx chain. At loop
+  // depth it costs the same RAM and roughly 100 bytes less stack.
+  //
+  // The POSITION is load bearing, not incidental. After the MIDI drain, so a
+  // request made by this pass's SysEx is applied in this pass; before the
+  // transport section (4) and the mode handlers (6), so the sequencer never
+  // advances onto a sibling, and the panel never edits one, whose layout is
+  // still stale. Drained to empty rather than one per pass for the same reason.
+  //
+  // Known window, stated rather than hidden: a host that writes a layout and
+  // reads the SIBLING back inside a single midi_rx_poll drain sees the old
+  // value. Separate round trips, which is what every tool and the suite do, do
+  // not. Nothing is lost either way; the mirror still lands.
+  while (eng.ServiceLayoutSync()) {}
 
 #ifdef SUPEROS_COMBINED
   if (midi_take_fw_switch() == FW_D650) {
@@ -1125,6 +1660,39 @@ void loop() {
     combined_switch_firmware(FW_D650);
   }
 #endif
+
+  // SysEx 0x4A: reboot into the resident SysEx bootloader for a firmware
+  // update over USB-C or DIN, no panel access needed. Flush pending saves,
+  // detach USB cleanly so the bootloader's own device re-enumerates, park
+  // BOOT_MAGIC in GPIOR0 (survives the jump; cleared by any real reset) and
+  // enter the boot section.
+  if (midi_take_boot_request()) {
+    save_dirty(eng);
+    if (s_settings_dirty) { save_settings(g_settings); s_settings_dirty = false; }
+    cli();
+#ifdef SUPEROS_USB_MIDI
+    UDIEN = 0;
+    UDCON |= (1 << DETACH);
+    _delay_ms(30);                 // host must register the drop first
+    USBCON = 0;
+    PLLCSR = 0;
+#endif
+    GPIOR0 = 0xB7;                 // BOOT_MAGIC, keep in sync with bootload.c
+    asm volatile("jmp 0x1F000");   // boot section (BOOTRST, BOOTSZ=01)
+  }
+
+  // SysEx 0x71: commit a staged replacement bootloader. Deferred to here so
+  // saves are flushed first and the copy does not run from inside the MIDI RX
+  // path: it halts the CPU for tens of milliseconds. bootupd_commit() verifies
+  // the staged image against the host's CRC before it touches anything live.
+  {
+    uint16_t want_crc;
+    if (midi_take_bootupd_commit(want_crc)) {
+      save_dirty(eng);
+      if (s_settings_dirty) { save_settings(g_settings); s_settings_dirty = false; }
+      midi_send_bootupd_status(bootupd_commit(want_crc));
+    }
+  }
 
   if (g_settings.clock_source != CLK_SRC_MIDI) {
     mc.pulses = 0; mc.transport = false; mc.started = false; mc.stopped = false;
@@ -1149,7 +1717,15 @@ void loop() {
   bool replay_tick = false;
   if ((want_run && !s_want_run) || (mc.started && want_run)) {
     eng.Start(mode == MODE_PLAY, mode == MODE_COMPOSE);
-    { const uint8_t sreg = SREG; cli(); s_clk_running = true; SREG = sreg; }
+    { const uint8_t sreg = SREG; cli(); s_clk_running = true;
+      // G10 phase alignment: a Start from the host IS the downbeat, so the
+      // indicator phase is zeroed with the sequencer's rather than carrying
+      // whatever the previous passage left. Only when slaved: on the internal
+      // clock the oscillator owns the phase and zeroing it would step the LED.
+#ifndef G10_BREAK
+      if (ext_sync) s_half_tick = 0;
+#endif
+      SREG = sreg; }
     midiRT(0xFA);
     replay_tick = !ext_sync && !clkB.rising_now() && s_clk_edge_seen &&
                   (uint32_t)(micros() - s_clk_edge_us) < CLK_EDGE_GRACE_US;
@@ -1167,6 +1743,28 @@ void loop() {
 
   // 5. Clock — external MIDI clock when present, otherwise the 808's own
   // 24-PPQN tempo clock (TEMPO knob / rear sync jack).
+  //
+  // G10: the INDICATOR's phase source follows the clock source, which is the
+  // half of this that was missing. Nothing in the MIDI-clock-IN path advanced
+  // s_half_tick, so while slaved tempo_blink() read a phase driven by the
+  // TEMPO knob. Note the defect was only ever visible while STOPPED: running,
+  // the LED is eng.BeatBlink(), which is fed by eng.ClockTick() below and was
+  // already correct on either clock.
+  //
+  // Handing the phase back is as much of the fix as taking it. The oscillator
+  // tracker's estimates are stale after a slaved passage, so they are reset the
+  // way Stop resets them and the tracker re-locks from scratch.
+  static bool s_clk_ext_prev = false;
+  if (ext_sync != s_clk_ext_prev) {
+    const uint8_t sreg = SREG; cli();
+    s_clk_ext = ext_sync;
+    if (!ext_sync) {
+      s_per_stop = 0; s_stop_seen = 0; s_k_half = 0; s_clk_last_us = micros();
+    }
+    SREG = sreg;
+    s_clk_ext_prev = ext_sync;
+  }
+
   uint8_t ticks = 0;
   if (ext_sync) {
     ticks = mc.pulses;
@@ -1184,15 +1782,37 @@ void loop() {
     s_clk_edge_seen = false;   // stale; also guards the ~71 min micros() wrap
   }
   // Feed the engine the measured 24-PPQN period, whichever clock is driving
-  // (internal, DIN sync, or MIDI): ratchet retrigger spacing derives from it.
+  // (internal, rear sync, or MIDI): ratchet retrigger spacing derives from it.
   // A burst of MIDI pulses drained in one pass averages across the burst;
   // out-of-range intervals (first tick after silence) are rejected inside
   // SetTickPeriod.
   static uint32_t s_tick_us_prev = 0;
   if (ticks) {
     const uint32_t tus = micros();
-    if (s_tick_us_prev) eng.SetTickPeriod((uint32_t)(tus - s_tick_us_prev) / ticks);
+    if (s_tick_us_prev) {
+      const uint32_t per = (uint32_t)(tus - s_tick_us_prev) / ticks;
+      eng.SetTickPeriod(per);
+      // G10: s_per_run is the MUSICAL reference the stopped-blink ratio is
+      // measured against, and clk_track_edge divides the oscillator's pulse
+      // rate by it when the panel clock takes over again. Keep it in step with
+      // whichever clock is actually driving, with the same range gate the
+      // tracker applies, or the first seconds after unplugging a slaved host
+      // blink at the old tempo's ratio.
+      if (ext_sync && per >= 5000UL && per <= 150000UL) {
+        const uint8_t sreg = SREG; cli(); s_per_run = per; SREG = sreg;
+      }
+    }
     s_tick_us_prev = tus;
+    if (ext_sync) {
+      // Two half-ticks per musical tick: exactly what clk_track_edge's running
+      // branch applies per 24-PPQN tick. An incoming 0xF8 IS the musical rate,
+      // so unlike the oscillator it needs no ratio estimate at all.
+#ifndef G10_BREAK
+      const uint8_t sreg = SREG; cli();
+      half_tick_advance((uint16_t)(2 * ticks));
+      SREG = sreg;
+#endif
+    }
   }
   for (uint8_t t = 0; t < ticks; ++t) {
     if (eng.ClockTick()) {
@@ -1205,13 +1825,22 @@ void loop() {
     }
   }
 
-  // 5b. Config menu: double-tap CLEAR to open, step 16 or another double-tap to
-  // close. s_menu_hold keeps the mode handlers frozen until CLEAR is released so
-  // the closing press can't fall through into a mode handler.
-  if (!s_menu && !s_menu_hold && clr.dtap) {
-    s_menu = true;
-    clr.consumed = true;
-  } else if (s_menu && clr.dtap) {
+  // 5b. Config menu. ENTRY, claim-133: the tool map's STEP 16 is the ONLY
+  // SuperOS way in. The CLEAR-held + TAP chord (claim-116) is retired from
+  // this side at the player's ask -- "clear + tap doesnt bring up the menu
+  // config, that is only for d650c mode" -- because with the tool map on the
+  // bare press (claim-132), CLEAR is the most-used key on the panel and a
+  // chord on it kept firing the menu mid-performance. The D650C side keeps
+  // the chord (emu_avr.cpp menu_gesture): its panel has no tool map, so the
+  // chord is its only route.
+  //
+  // EXIT is unchanged: PATTERN CLEAR is the only way out (the player's
+  // rule). TAP is "back" inside the menu and must never leave it, which is
+  // handled by TAP simply having no exit path in handle_config_menu.
+  // s_menu_hold keeps the mode handlers frozen until CLEAR is released so
+  // the closing press cannot fall through into a mode handler.
+  if (s_menu && clr.tap) {
+    clr.tap = false;
     s_menu = false;
     s_menu_hold = true;
   }
@@ -1221,6 +1850,14 @@ void loop() {
   // sequencer is stopped (a flash write stalls the CPU for a few ms, which
   // would slip the clock mid-playback). This is what makes panel config
   // changes survive a power cycle.
+  // claim-118: a master-polymeter change made under the clock owes the store a
+  // patch. Settle it here, where every other deferred write already waits for
+  // the transport to stop.
+  if (!eng.running && eng.MasterPolyOwed() && eng.ServiceMasterPoly()) {
+    save_dirty(eng);
+    for (uint8_t p = 0; p < NUM_PATTERNS; ++p) midi_send_pattern_dump(p);
+  }
+
   if (s_settings_dirty && !s_menu && !eng.running) {
     save_settings(g_settings);
     s_settings_dirty = false;
@@ -1229,26 +1866,37 @@ void loop() {
   if (s_menu || s_menu_hold) {
     if (s_menu) handle_config_menu();
     midi_tx_service(eng);
-    if (midi_take_save_request(eng))  save_dirty(eng);
-    if (midi_take_settings_save(eng)) save_settings(g_settings);
+    // Never write flash while the sequencer is running. Short-circuit on
+    // purpose: the request is NOT consumed while running, so it fires the
+    // moment the transport stops rather than being dropped.
+    if (!eng.running && midi_take_save_request(eng))  save_dirty(eng);
+    if (!eng.running && midi_take_settings_save(eng)) save_settings(g_settings);
     if (midi_take_panelmap_save(eng)) save_panel_map(g_panel_map);
     eng.SetIndicators(eng.live_variation(), modeVal == MODE_2ND_PART);
     frame = build_menu_frame();
     return;
   }
 
-  // 5c. Tool selection. Holding CLEAR past the hold threshold opens the tool
-  // map; a step press while it is open latches that tool. Releasing with no step
-  // pressed exits the current tool. Tools live only in the write modes, where
-  // CLEAR's stock chord (STEP NUMBER) is the one thing they have to share with.
-  const bool tools_ok = mode_is_write(mode);
+  // 5c. Tool selection. CLEAR down shows the tool map INSTANTLY (claim-132);
+  // a step press while it is down latches that tool, releasing with no step
+  // pressed exits the current tool. Tools live in the write modes and, since
+  // claim-132, in MANUAL PLAY ("in pattern write mode or manual play it
+  // should bring up the tool selection when i press the clear button"), where
+  // CLEAR previously did nothing at all. While CLEAR is down the mode's own
+  // handler is frozen, so MANUAL PLAY's slot selects never race a latch.
+  const bool tools_ok = mode_is_write(mode) || mode == MODE_MANUAL_PLAY;
   if (tools_ok && clr.map_open() && clearB.held()) {
     for (uint8_t s = 0; s < NUM_STEP_BTNS; ++s)
       if (stepB[s].rising()) {
-        s_tool = (uint8_t)(s + 1);
         clr.chorded  = true;
         clr.consumed = true;
         s_pre_ref = preVal;
+        // STEP 16 is the CONFIG MENU, not a tool that latches: it opens the
+        // menu and leaves s_tool clear, so the menu's own CLEAR exit is the
+        // only thing that has to unwind it.
+        if ((uint8_t)(s + 1) == TOOL_MENU) { s_tool = TOOL_NONE; s_menu = true; }
+        else if (!((TOOLS_IMPLEMENTED >> s) & 1)) s_tool = TOOL_NONE;  // empty slot
+        else                                 s_tool = (uint8_t)(s + 1);
       }
   }
   if (clearB.falling()) {
@@ -1256,6 +1904,53 @@ void loop() {
     if (clr.hold_seen && !clr.chorded) s_tool = TOOL_NONE;
   }
   if (clr.tap && s_tool != TOOL_NONE) { s_tool = TOOL_NONE; clr.tap = false; }
+
+  // PRE SCALE, folded into LENGTH (claim-116): with LENGTH latched, HOLD
+  // PATTERN CLEAR and move the PRE SCALE dial to set the pattern's prescale.
+  //
+  // CHECKED HERE, NOT IN handle_tool, and that is forced rather than stylistic:
+  // holding CLEAR past CLEAR_HOLD_MS (350 ms) opens the tool map, and an open
+  // map FREEZES the tool handlers. A gesture whose whole premise is a CLEAR
+  // hold therefore cannot be seen from inside the handler it belongs to. It
+  // keeps its own dial reference for the same reason -- handle_tool's s_pre_ref
+  // stops being updated the moment the map opens.
+  //
+  // It reacts to a CHANGE made during the hold, never to where the dial is
+  // resting, which is the rule every other PRE SCALE reader on this machine
+  // follows: the stock procedure is "set PRE SCALE, then press CLEAR", and
+  // reacting to rest position is what once let an ordinary CLEAR tap restamp a
+  // pattern written at a different detent.
+  {
+    static uint8_t s_len_pre_ref = 0xFF;
+    if (tools_ok && s_tool == TOOL_LENGTH && clearB.held()) {
+      if (s_len_pre_ref == 0xFF) {
+        s_len_pre_ref = preVal;              // arm on the dial's entry position
+      } else if (preVal != s_len_pre_ref) {
+        s_len_pre_ref = preVal;
+        clr.chorded = true;   // this hold was an edit, not a pending CLEAR tap
+        if (s_ilen_phase) {
+          // VOICE phase (the display is blinking): this dial move sets the
+          // SELECTED voice's own PRE SCALE, which is the player's rule --
+          // "if the led is bright we change the pre-scale for the whole
+          // pattern and if it is blinking then we set the pre scale for that
+          // instrument, same thing as setting pattern length" (claim-124).
+          //
+          // Dialling the value the voice already holds clears the override and
+          // hands it back to the pattern. That is the same "press what it
+          // already is to clear it" gesture LENGTH and DIR use, which is the
+          // only way to get back with a dial that has no off position.
+          eng.SetInstPre(inst, eng.GetInstPre(inst) == preVal ? 0xFF : preVal);
+          midi_send_pattern_dump(eng.cur_pat);
+        } else {
+          eng.CommitPrescale(preVal);
+          s_pre_committed = preVal;
+          midi_send_layout_update(eng.cur_pat);
+        }
+      }
+    } else {
+      s_len_pre_ref = 0xFF;
+    }
+  }
 
   // 6. Dispatch.
   if (mode != prev_mode) {
@@ -1292,7 +1987,11 @@ void loop() {
   // the resting detent over a pattern that was written at a different one.
   // That is what turned a mistimed double-press — one the burst counter did not
   // read as a menu gesture — into a pattern whose step timing had changed.
-  if (clr.tap && tools_ok && s_tool == TOOL_NONE) {
+  // mode_is_write and not tools_ok: MANUAL PLAY joined the tool modes in
+  // claim-132, but its bare CLEAR tap stays inert -- the stock prescale
+  // commit is a WRITE-mode gesture and silently stamping the dial from a
+  // performance mode is the exact accident this guard exists to stop.
+  if (clr.tap && mode_is_write(mode) && s_tool == TOOL_NONE) {
     clr.tap = false;
     if (preVal != s_pre_committed) {
       s_pre_committed = preVal;
@@ -1310,8 +2009,11 @@ void loop() {
 
   // 7. Web-editor MIDI link, outgoing side.
   midi_tx_service(eng);
-  if (midi_take_save_request(eng))  save_dirty(eng);
-  if (midi_take_settings_save(eng)) save_settings(g_settings);
+  // As in the menu path: a save asked for mid-pattern waits for the stop.
+  // A flash page write halts the CPU for milliseconds, which is a dropped step
+  // if it lands while the sequencer is counting.
+  if (!eng.running && midi_take_save_request(eng))  save_dirty(eng);
+  if (!eng.running && midi_take_settings_save(eng)) save_settings(g_settings);
   if (midi_take_panelmap_save(eng)) save_panel_map(g_panel_map);
 
   // 8. Panel indicator LEDs + next display frame.
@@ -1334,6 +2036,7 @@ void loop() {
       (play_sec != 0xFF) ? ((play_sec & 1) != 0)
                          : (mode_is_write(mode) ? ((disp_section & 1) != 0)
                                                 : (mode == MODE_2ND_PART));
+  eng.EndPulseIfDue();   // claim-128: last chance before the pass's own tail
   eng.SetIndicators(eng.live_variation(), part2_lamp);
   if (tools_ok && clr.map_open() && clearB.held()) frame = build_map_frame();
   else if (tools_ok && s_tool != TOOL_NONE)        frame = build_tool_frame(s_tool, inst);

@@ -447,7 +447,10 @@ const NI = INSTS.length;                       // 12
 const NSEC = 4, SECLEN = 16, MAXSTEPS = NSEC * SECLEN;
 const NSLOTS = 16, NBASIC = 12, NPAT = 32, NTRK = 12, TRKMAX = 64;
 const RATCHET_SLOTS = 16, PROB_SLOTS = 40;
-const PATTERN_BYTES = NI*NSEC*2 + NSEC + 2 + RATCHET_SLOTS*2 + PROB_SLOTS*2 + NI + 2; // 228
+// v0.3 appends dir (1), per-voice direction and per-voice pre-scale (a nibble
+// each, packed two voices per byte) AFTER poly, so v0.2 records stay a prefix.
+const PATTERN_BYTES = NI*NSEC*2 + NSEC + 2 + RATCHET_SLOTS*2 + PROB_SLOTS*2 + NI + 2
+                    + 1 + 2*Math.ceil(NI/2); // 241
 const TRACK_BYTES = 1 + TRKMAX;                // 65
 const MFR = 0x7D;
 const SPB = [3,6,4,8];                         // steps per beat, by pre-scale
@@ -510,6 +513,7 @@ function emptyPattern(){
     rstep: new Uint8Array(RATCHET_SLOTS).fill(0xFF), rval: new Uint8Array(RATCHET_SLOTS),
     pstep: new Uint8Array(PROB_SLOTS).fill(0xFF),    pval: new Uint8Array(PROB_SLOTS),
     ilen: new Uint8Array(NI), poly: 0,
+    dir: 0, idir: new Uint8Array(Math.ceil(NI/2)), ipre: new Uint8Array(Math.ceil(NI/2)),
   };
 }
 function serializePattern(p){
@@ -525,6 +529,9 @@ function serializePattern(p){
   b.set(p.pval, o); o += PROB_SLOTS;
   b.set(p.ilen, o); o += NI;
   b[o++] = p.poly & 0xFF; b[o++] = (p.poly >> 8) & 0xFF;
+  b[o++] = p.dir;
+  b.set(p.idir, o); o += p.idir.length;
+  b.set(p.ipre, o); o += p.ipre.length;
   return b;
 }
 function deserializePattern(b){
@@ -537,7 +544,10 @@ function deserializePattern(b){
   p.pstep = b.slice(o,o+PROB_SLOTS);    o += PROB_SLOTS;
   p.pval  = b.slice(o,o+PROB_SLOTS);    o += PROB_SLOTS;
   p.ilen  = b.slice(o,o+NI);            o += NI;
-  p.poly  = b[o] | (b[o+1]<<8);
+  p.poly  = b[o] | (b[o+1]<<8); o += 2;
+  p.dir   = b[o++] & 3;
+  p.idir  = b.slice(o, o+p.idir.length); o += p.idir.length;
+  p.ipre  = b.slice(o, o+p.ipre.length); o += p.ipre.length;
   return p;
 }
 

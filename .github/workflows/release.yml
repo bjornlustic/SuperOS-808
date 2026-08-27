@@ -70,7 +70,9 @@ jobs:
           mkdir -p dist
           cp SuperOS-808_*_app-flash_*.syx dist/
           cp SuperOS-808_*_app-flash_*-full.hex dist/
-          cp service-install.syx dist/
+          # No separate service-install.syx: the SPM flash service is folded
+          # into the app .syx (and the -full.hex) by makesyx.py, so one file
+          # updates a machine over MIDI and one file programs a fresh board.
           cp .pio/build/bootloader/firmware.hex dist/SuperOS-808_bootloader.hex
           VER=$(sed -n 's/^custom_project_version *= *//p' platformio.ini | head -1)
           echo "version=$VER" >> "$GITHUB_OUTPUT"

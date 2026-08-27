@@ -2,9 +2,103 @@
 
 Notable changes per release. Dates are release dates.
 
-## v0.3 (unreleased)
+## v0.3 — 2026-08-26
+
+The baseline release: every feature below has been exercised on a real machine,
+most of it by an automated panel-injection harness that presses the keys and
+reads the state back over SysEx.
+
+### Added
+
+**Instant tool map, and in MANUAL PLAY too.** The map is up the moment CLEAR
+goes down — no hold threshold — in both write modes and in MANUAL PLAY, where
+CLEAR previously did nothing. A step press while CLEAR is down latches that
+tool; the latched tool blinks in the map. The stock CLEAR+step chord is gone
+with the wait: its function (step number) lives in the LENGTH tool.
+
+**Per-voice direction and per-voice pre-scale, saved with the pattern.** The
+DIRECTION tool gains the same TAP-toggled voice phase as LENGTH and POLYMETER:
+set one voice running backward, random or ping-pong against the pattern. With
+LENGTH latched, holding CLEAR and turning Pre-Scale in the voice phase gives
+one voice its own step rate, so it plays between the master's steps. Both are
+stored per pattern, per voice; pattern direction is saved with the pattern too.
+
+**Writing a part that does not exist creates it.** A fresh pattern has only its
+first sixteen steps; the first press in 2ND PART — or in sections 3 and 4 via
+the SECTION tool — now extends the pattern there and lands the press, instead
+of presenting a dead panel.
+
+**The chain is drawn.** Chained slots and the queued pattern show on the step
+LEDs; chains cap at four slots.
+
+**D650C mode: instant step entry.** The 1981 program services step entry only
+once per sequencer step and drops fast presses — measured against the original
+program image, continuous tapping registers about one press per one and a half
+steps, worse at slow tempos. The bridge now writes the entry directly into the
+emulated pattern memory, addressed exactly as the program would (verified
+byte-identical across every instrument, key and bank), so presses land the
+instant the key goes down, as fast as you can tap, and entry works with the
+transport stopped as well.
+
+**D650C mode: the config menu opens in place, and the machine keeps playing.**
+CLEAR held + TAP brings up the menu inside the emulator without a reboot; only
+the panel is borrowed, so the sequencer keeps time. Menu step 9 blinks on the
+D650C side to say which firmware you are standing in, and pressing it returns
+to superOS.
+
+### Changed
+
+**The tool map is renumbered, contiguous 1–14.** PRE-SCALE folded into LENGTH,
+the ACCENT tool retired (the 808's accent is one shared level per step — the
+tool implied a per-instrument control the hardware does not have), SWING moved
+to slot 2, slot 15 is dark and unlatchable, and step 16 is the config menu.
+
+**The config menu moved to the tool map's step 16.** The CLEAR double-tap is
+retired, and CLEAR held + TAP no longer opens the menu on the superOS side —
+that chord is the D650C-mode entry only. A CLEAR tap is the only way out; TAP
+is "back" inside the menu and never exits. The menu no longer stops the
+sequencer on either firmware.
+
+**Chase delete moved to PATTERN CLEAR mode**, the mode whose whole job is
+erasing: hold CLEAR while running and the selected voice's hits are erased
+under the playhead, from the moment the button goes down. Stopped, a CLEAR tap
+erases the selected slot, as always.
+
+**Steps a voice cannot play are unpressable.** Past a voice's own loop length,
+steps are dark in the write display and refuse the pick press in RATCHET and
+PROBABILITY, so hits can no longer accumulate where nothing will sound.
+
+**The section chosen with the SECTION tool stays on display** after the tool is
+released, until the Mode Dial moves — sections 3 and 4 are actually editable
+from the panel now.
+
+**Master polymeter applies while playing.** The change lands in RAM immediately
+and the store write waits for the transport to stop, so nothing stalls under
+the clock.
+
+**The pattern record grew from 228 to 241 bytes** (direction and the per-voice
+overrides travel with the pattern). Old records load as a prefix; the web
+editor speaks the new layout.
+
+**The program image moved out of the app region** into its own flash section,
+which also un-crowded every build.
 
 ### Fixed
+
+**D650C step entry debounced across scan periods.** The emulator bridge took
+its three debounce samples one column-revisit apart (7.6 ms each), which
+filters nothing and cost 15 ms of pure latency; the samples now land inside one
+column dwell and a press is delivered in about 2 ms, matching superOS.
+
+**The VARIATION A lamp flickered while superOS played.** The trigger window was
+holding the lamp line low longer than the original program does; measured on
+the machine against the 1981 program on the same panel, the remaining duty
+difference is inside what the lamp's RC filter absorbs.
+
+**2ND PART could not be written at all** on a pattern without a second part —
+every press was silently blocked. See "writing a part that does not exist
+creates it" above.
+
 
 **Probability could not be set to "always", and step 16 corrupted the slot.** The panel
 tool passed the raw key number into `prob_set`, so step 16 wrote a chance of 16 — which

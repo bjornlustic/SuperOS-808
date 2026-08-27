@@ -32,13 +32,28 @@ static inline void ext_put(d650_host *h, uint16_t a, uint8_t v) {
   uint8_t nw  = (uint8_t)((old & (0xF0 >> sh)) | ((v & 0x0F) << sh));
   if (nw != old) { h->ext[a >> 1] = nw; h->ext_dirty = 1; }
 }
+// The commit half of ext_refresh, split out and noinline for flash. This file is
+// built -O3 on combined AVR builds, so ext_addr+ext_put inlined into all FIVE
+// io_write cases and io_write came to 948 B; out of line it is one body plus
+// five rcalls. Measured on combined-nat, which sits 170 B under a 0xD700 app
+// ceiling that only make_syx enforces.
+//
+// The SPLIT is the point, not the noinline. Both early-outs stay inline above,
+// so the common path (WE inactive, or no chip enabled) is byte-for-byte the code
+// it was and pays nothing. The call is added only where a RAM write actually
+// commits, which already costs ext_addr+ext_put; ~8 cycles of rcall+ret on top
+// of ~30. NOT measured on hardware: G5 (the emulator holds real time, 208% at
+// 16 MHz) has not been re-taken since this change.
+static void __attribute__((noinline)) ext_commit(d650_host *h) {
+  ext_put(h, ext_addr(h), h->lat_c);
+}
 // Write-transparent while WE is active and a chip is enabled: any data/address/
 // strobe latch change commits the PORTC latch, like the real SRAM. The CPU only
 // strobes with a stable address + data.
-static void ext_refresh(d650_host *h) {
+static inline void ext_refresh(d650_host *h) {
   if (((h->lat_i >> 0) & 1) != D650_WE_ACTIVE) return;
   if (!ext_on(h)) return;
-  ext_put(h, ext_addr(h), h->lat_c);
+  ext_commit(h);
 }
 
 // Selected scan row from PORTH (active-low at the CPU, one row at a time; the
@@ -96,7 +111,7 @@ void d650_init(d650_host *h, const uint8_t *prg, const d650_drivers *drv) {
   for (unsigned i = 0; i < sizeof *h; i++) ((uint8_t *)h)[i] = 0;
   if (drv) h->drv = *drv;
   ucom4_io io = { io_read_a, io_read_b, io_read_c, io_read_d, io_write, h };
-  ucom4_reset(&h->cpu, prg, &io);
+  ucom4_reset(D650_CPU(h), prg, &io);
 }
-uint32_t d650_step(d650_host *h) { return ucom4_step(&h->cpu); }
-void d650_clock(d650_host *h, int level) { ucom4_set_int(&h->cpu, level); }
+uint32_t d650_step(d650_host *h) { return ucom4_step(D650_CPU(h)); }
+void d650_clock(d650_host *h, int level) { ucom4_set_int(D650_CPU(h), level); }

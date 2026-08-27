@@ -16,16 +16,37 @@
 #if defined(SUPEROS_COMBINED) && defined(__AVR__)
 #pragma GCC optimize("O3")
 #endif
+// prev_pc is trace/debug state read only by the host-side tests and the MAME
+// differential oracle. On the device nothing reads it, and the store costs ~4%
+// of real time on every instruction, so the device build drops it. The guard is
+// __AVR__ rather than a build flag so the oracle can never accidentally lose it.
+#if defined(__AVR__) && !defined(UCOM4_OMIT_PREV_PC)
+#define UCOM4_OMIT_PREV_PC 1
+#endif
 #include "ucom4.h"
+#ifdef UCOM4_PC_PROFILE
+uint16_t ucom4_pc_hist[32];
+#endif
 
 // ---- memory -----------------------------------------------------------------
 // data_96x4 map: 0x00-0x4F and 0x70-0x7F are RAM; 0x50-0x6F unmapped (read 0).
-static inline int ram_mapped(uint8_t a) { return a <= 0x4F || a >= 0x70; }
+// data_96x4 has a hole at 0x50-0x6F which reads as 0. Only WRITES test for it.
+//
+// Reads do not, and do not need to: every write in this file and in the
+// translated core goes through the test, and ucom4_reset zeroes the whole
+// array, so those 32 bytes are zero from reset and stay zero for the life of
+// the CPU. Reading them straight out of the array therefore gives the same 0
+// the hole gives, without a bounds test on the single most common operation the
+// core performs. Worth roughly 4 KB of translated code.
+//
+// One compare rather than two: mapped <=> (a - 0x50) has wrapped past the hole.
+static inline int ram_mapped(uint8_t a) { return (uint8_t)(a - 0x50u) >= 0x20u; }
 
 // uCOM-43 extended registers X,Y,R,S,W,Z,F live at datamask-index (0x79-0x7F).
 enum { REG_X=0, REG_Y, REG_R, REG_S, REG_W, REG_Z, REG_F };
 
 // ---- ports ------------------------------------------------------------------
+uint16_t ucom4_io_calls;   /* published by the probe; no longer ticked per io */
 static uint8_t input_r(ucom4_t *c, int index) {
   index &= 0xf;
   uint8_t inp = 0;
@@ -63,6 +84,25 @@ void ucom4_set_int(ucom4_t *c, int level) {
   if (c->int_line == 0 && level) c->int_f = 1;  // rising edge
   c->int_line = level ? 1 : 0;
 }
+
+#ifdef UCOM4_HLE
+#include "ucom4_hle.h"
+#endif
+#ifdef UCOM4_NATIVE
+// Statically translated hot regions (generated; see tools/d650/gen_native.py).
+// Needs input_r/output_w/push/pop above. Supersedes the hand HLE for the ISR.
+uint16_t ucom4_nat_calls;          /* bench telemetry, read by the cycle probe */
+uint16_t ucom4_nat_cycles;         /* emulated cycles executed natively */
+uint16_t ucom4_idle_hits;          /* mainline reached its wait loop (0x0BE) */
+uint16_t ucom4_isr_count;          /* interrupt entries, both engines */
+uint16_t ucom4_int_cycles;         /* cycles that fell back to the interpreter */
+#include "ucom4_native.h"
+uint8_t ucom4_nat_state(void) { return nat_state; }
+#endif
+
+#ifdef UCOM4_SINGLETON
+ucom4_t ucom4_the_cpu;
+#endif
 
 // ---- opcode dispatch map ----------------------------------------------------
 // opmap[op] = handler id (low 7 bits) | 0x80 if the opcode has an argument
@@ -147,6 +187,12 @@ void ucom4_reset(ucom4_t *c, const uint8_t *prg, const ucom4_io *io) {
 // through the cached `ram` pointer with the same mapping as MAME's data_96x4.
 static uint16_t run_chunk(ucom4_t *c, uint16_t cycles) {
   if (!opmap_ready) build_opmap();   // harnesses may bypass ucom4_reset
+#ifdef UCOM4_HLE
+  if (!hle_state) hle_probe(c);      // once: does the native ISR fit this image
+#endif
+#ifdef UCOM4_NATIVE
+  if (!nat_state) nat_probe(c);      // once: is this the image we compiled
+#endif
   const uint8_t *prg = c->prg;
   const uint16_t prgmask = c->prgmask;
   const uint8_t datamask = c->datamask;
@@ -164,25 +210,90 @@ static uint16_t run_chunk(ucom4_t *c, uint16_t cycles) {
 
   // RAM/register helpers on the cached state. INC_PC: only the low 8 bits
   // auto-increment (8-bit add, no carry into the page). bm_lut: AVR has no
-  // barrel shifter (1 << n is a loop), so look the bitmask up.
+  // barrel shifter (1 << n is a loop), so look the bit mask up.
   static const uint8_t bm_lut[4] = { 1, 2, 4, 8 };
+  // Only the bit ops below read this, so it is looked up where it is used
+  // rather than once per instruction: on the common path the eager version was
+  // an index, a load and a mask that nothing consumed. Evaluating it twice
+  // inside one handler (H_CMB) is free, gcc commons it.
+  #define BM()         (bm_lut[op & 0x03])
   #define RAM_A()      ((uint8_t)((((uint16_t)dph << 4) | dpl) & datamask))
-  #define RAM_R()      (ram_mapped(RAM_A()) ? (ram[RAM_A()] & 0xf) : 0)
+  #define RAM_R()      (ram[RAM_A()] & 0xf)   /* the hole is held at 0; see ram_mapped */
   #define RAM_W(v)     do { uint8_t a_ = RAM_A(); if (ram_mapped(a_)) ram[a_] = (v) & 0xf; } while (0)
   #define REG_R(i)     (ram[(uint8_t)(datamask - (i)) & 0x7F] & 0xf)
   #define REG_W(i, v)  (ram[(uint8_t)(datamask - (i)) & 0x7F] = (v) & 0xf)
   #define INC_PC()     (pc = (uint16_t)((pc & 0xff00u) | (uint8_t)((uint8_t)pc + 1)))
 
   while (rem > 0) {
+#ifdef UCOM4_NATIVE
+    // Translated region: hand the cached state over and run compiled code
+    // until control leaves the region or the budget runs out. c->op carries
+    // the LI/EI-adjacency the interrupt gate and LI-blocking need across the
+    // boundary; prev_op follows it, which is all the interpreter reads of it.
+    if (nat_state == 1 && NAT_HAS(pc)) {
+      c->pc = pc; c->acc = acc; c->dpl = dpl; c->dph = dph;
+      c->op = op; c->prev_op = prev_op; c->arg = arg;
+      c->skip = skip; c->carry_f = carry;
+      c->inte_f = inte; c->int_f = intf;
+      c->timer_cnt = timer_cnt;
+      ucom4_nat_calls++;
+      {
+        const int16_t r0 = rem;
+        rem = ucom4_native_run(c, rem);
+        ucom4_nat_cycles += (uint16_t)(r0 - rem);
+      }
+      pc = c->pc; acc = c->acc; dpl = c->dpl; dph = c->dph;
+      op = c->op; prev_op = c->prev_op; arg = c->arg;
+      skip = (uint8_t)(c->skip != 0); carry = c->carry_f;
+      inte = c->inte_f; intf = c->int_f;
+      timer_cnt = c->timer_cnt;
+      continue;
+    }
+#endif
     step_cyc = 0;
+#ifdef UCOM4_PC_PROFILE
+    // Where does the ROM actually spend its cycles? 32 buckets of 64 program
+    // bytes. Bench only, and it costs throughput while enabled: the point is
+    // to aim high-level emulation at the right loop instead of guessing.
+    ucom4_pc_hist[(pc >> 6) & 31]++;
+#endif
 
     // Service interrupt, but not right after LI($9x)/EI($31), nor while skipping.
     if (intf && inte && (op & 0xf0) != 0x90 && op != 0x31 && !skip) {
       step_cyc++;
+#ifdef UCOM4_NATIVE
+      ucom4_isr_count++;
+#endif
       push_stack_pc(c, pc);
       pc = 0xf << 2;   // 0x003C
       intf = 0;
       inte = 0;        // UCOM-43: interrupts disabled on entry
+
+#ifdef UCOM4_HLE
+      // Hand the whole routine to the native version when it recognises this
+      // image. Spilling the cached state and reloading it is paid once per
+      // interrupt, against the ~57 emulated machine cycles of interpretation it
+      // replaces, and the routine is ~93% of everything this core executes.
+      c->pc = pc; c->acc = acc; c->dpl = dpl; c->dph = dph;
+      c->op = op; c->prev_op = prev_op; c->arg = arg;
+      c->skip = skip; c->carry_f = carry;
+      c->inte_f = inte; c->int_f = intf;
+      {
+        const uint8_t hc = hle_isr(c);
+        if (hc) {
+          pc = c->pc; acc = c->acc; dpl = c->dpl; dph = c->dph;
+          op = c->op; prev_op = c->prev_op; arg = c->arg;
+          skip = c->skip; inte = c->inte_f;
+          step_cyc = (uint8_t)(step_cyc + hc);
+          if (timer_cnt >= 0) {
+            timer_cnt -= (int16_t)step_cyc;
+            if (timer_cnt <= 0) { c->timer_f = 1; timer_cnt = -1; }
+          }
+          rem -= (int16_t)step_cyc;
+          continue;
+        }
+      }
+#endif
     }
 
     prev_op = op;
@@ -194,7 +305,6 @@ static uint16_t run_chunk(ucom4_t *c, uint16_t cycles) {
 
     step_cyc++;
     op = UCOM4_PRG_RD(prg, pc & prgmask);
-    uint8_t bitmask = bm_lut[op & 0x03];
     INC_PC();
     uint8_t h = opmap[op];
     if (h & 0x80) {                  // 2-byte opcode: fetch argument
@@ -269,28 +379,28 @@ static uint16_t run_chunk(ucom4_t *c, uint16_t cycles) {
       case H_XLY: step_cyc++; { uint8_t t = dpl; dpl = REG_R(REG_Y); REG_W(REG_Y, t); } break;
       case H_XHX: step_cyc++; { uint8_t t = dph; dph = REG_R(REG_X); REG_W(REG_X, t); } break;
 
-      case H_FBF: step_cyc++; skip = ((REG_R(REG_F) & bitmask) == 0); break;
-      case H_TAB: skip = ((acc & bitmask) != 0); break;
+      case H_FBF: step_cyc++; skip = ((REG_R(REG_F) & BM()) == 0); break;
+      case H_TAB: skip = ((acc & BM()) != 0); break;
       case H_XM:  { uint8_t o = acc; acc = RAM_R(); RAM_W(o); dph ^= (op & 3); } break;
       case H_XMD: { uint8_t o = acc; acc = RAM_R(); RAM_W(o); dph ^= (op & 3);
                     dpl = (dpl - 1) & 0xf; skip = (dpl == 0xf); } break;
-      case H_CMB: skip = ((acc & bitmask) == (RAM_R() & bitmask)); break;
+      case H_CMB: skip = ((acc & BM()) == (RAM_R() & BM())); break;
       case H_LM:  acc = RAM_R(); dph ^= (op & 3); break;
       case H_XMI: { uint8_t o = acc; acc = RAM_R(); RAM_W(o); dph ^= (op & 3);
                     dpl = (dpl + 1) & 0xf; skip = (dpl == 0); } break;
 
-      case H_TPB: skip = ((input_r(c, dpl) & bitmask) != 0); break;
-      case H_TPA: skip = ((input_r(c, UCOM4_PORTA) & bitmask) != 0); break;
-      case H_TMB: skip = ((RAM_R() & bitmask) != 0); break;
-      case H_FBT: step_cyc++; skip = ((REG_R(REG_F) & bitmask) != 0); break;
-      case H_RPB: output_w(c, dpl, c->port_out[dpl] & ~bitmask); break;
-      case H_REB: step_cyc++; output_w(c, UCOM4_PORTE, c->port_out[UCOM4_PORTE] & ~bitmask); break;
-      case H_RMB: RAM_W(RAM_R() & ~bitmask); break;
-      case H_RFB: step_cyc++; REG_W(REG_F, REG_R(REG_F) & ~bitmask); break;
-      case H_SPB: output_w(c, dpl, c->port_out[dpl] | bitmask); break;
-      case H_SEB: step_cyc++; output_w(c, UCOM4_PORTE, c->port_out[UCOM4_PORTE] | bitmask); break;
-      case H_SMB: RAM_W(RAM_R() | bitmask); break;
-      case H_SFB: step_cyc++; REG_W(REG_F, REG_R(REG_F) | bitmask); break;
+      case H_TPB: skip = ((input_r(c, dpl) & BM()) != 0); break;
+      case H_TPA: skip = ((input_r(c, UCOM4_PORTA) & BM()) != 0); break;
+      case H_TMB: skip = ((RAM_R() & BM()) != 0); break;
+      case H_FBT: step_cyc++; skip = ((REG_R(REG_F) & BM()) != 0); break;
+      case H_RPB: output_w(c, dpl, c->port_out[dpl] & ~BM()); break;
+      case H_REB: step_cyc++; output_w(c, UCOM4_PORTE, c->port_out[UCOM4_PORTE] & ~BM()); break;
+      case H_RMB: RAM_W(RAM_R() & ~BM()); break;
+      case H_RFB: step_cyc++; REG_W(REG_F, REG_R(REG_F) & ~BM()); break;
+      case H_SPB: output_w(c, dpl, c->port_out[dpl] | BM()); break;
+      case H_SEB: step_cyc++; output_w(c, UCOM4_PORTE, c->port_out[UCOM4_PORTE] | BM()); break;
+      case H_SMB: RAM_W(RAM_R() | BM()); break;
+      case H_SFB: step_cyc++; REG_W(REG_F, REG_R(REG_F) | BM()); break;
 
       default: break; // illegal: treated as NOP
     }
@@ -321,6 +431,48 @@ static uint16_t run_chunk(ucom4_t *c, uint16_t cycles) {
   c->cyc += spent;
   return spent;
 }
+
+#ifdef UCOM4_NATIVE
+// Device entry point. Straight into the translated core, with the interpreter
+// reached only for a pc the translation does not cover.
+//
+// Why not just call ucom4_run: run_chunk caches fifteen fields of CPU state in
+// locals, so entering it costs a prologue and an epilogue whether it executes
+// one instruction or a thousand. Measured at ~1300 clocks per call, which
+// against a 96-cycle batch is a third of the whole emulation budget at 4 MHz.
+// The translated core carries its own state, so on the covered path that
+// prologue buys nothing.
+uint32_t ucom4_run_native(ucom4_t *c, uint16_t cycles) {
+  int16_t rem = (int16_t)cycles;
+  while (rem > 0) {
+    if (nat_state == 1 && NAT_HAS(c->pc)) {
+      const int16_t before = rem;
+      rem = ucom4_native_run(c, rem);
+      ucom4_nat_cycles = (uint16_t)(ucom4_nat_cycles + (uint16_t)(before - rem));
+      if (rem < before) continue;              /* made progress: look again */
+    }
+    {
+      /* Uncovered pc: interpret, but only a short slice of it.
+       *
+       * Handing run_chunk the whole remaining batch meant that any excursion
+       * into untranslated code ran ~108 cycles at the interpreter's ~141 clocks
+       * each: a single 3.8 ms pass, during which the emulated CPU gets no
+       * interrupt, the panel is not scanned and the tempo clock is not sampled.
+       * That is an audible hitch, and it happened several times a second.
+       *
+       * Capping the slice does not make the excursion cheaper -- those cycles
+       * cost what they cost -- it spreads it over several passes so the
+       * services keep running at their normal cadence throughout. */
+      const uint16_t slice = (rem > 16) ? 16u : (uint16_t)rem;
+      const uint16_t ran = run_chunk(c, slice);
+      ucom4_int_cycles = (uint16_t)(ucom4_int_cycles + ran);
+      ucom4_nat_calls++;                       /* = fallback entries */
+      rem -= (int16_t)ran;
+    }
+  }
+  return (uint32_t)(int16_t)((int16_t)cycles - rem);
+}
+#endif
 
 uint32_t ucom4_run(ucom4_t *c, uint32_t cycles) {
   uint32_t total = 0;

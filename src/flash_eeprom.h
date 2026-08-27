@@ -11,13 +11,30 @@
 #include <string.h>
 
 // --- Arena geometry (absolute flash page numbers; one page = 256 bytes) ------
-// Arena = 0xE000..0x1DFFF = pages 0xE0..0x1DF (256 pages = 64 KB), all in RWW
+// Arena = 0x17E00..0x1DFFF = pages 0x17E..0x1DF (98 pages = 24.5 KB), all in RWW
 // (below the 0x1E000 NRWW edge). Split into two equal banks; page 0 of each
-// bank is its header, the rest hold one record each.
-static constexpr uint16_t FE_ARENA_FIRST_PAGE = 0xE0;
-static constexpr uint16_t FE_BANK_PAGES       = 128;          // pages per bank
+// bank is its header, the rest hold one record each. 63 record pages per bank
+// hold the 46 live blocks with room over.
+//
+// It was 64 KB at 0xE000, then 32 KB at 0x16000; it is now 24.5 KB at 0x17E00.
+// Everything below it is the .natcode region, where the statically translated
+// emulator program lives (see tools/d650/gen_native.py), and that translation
+// only pays off where it covers the program the emulated CPU is actually
+// running: an uncovered stretch drops back to the interpreter at roughly six
+// times the cost per emulated cycle. The arena gave up the space because it
+// never needed it -- a bank only has to hold the 48-block live set plus its
+// header, and 49 pages is exactly that: FE_MAX_BLOCKS live records plus the
+// bank header, which is the floor a garbage collection pass needs.
+//
+// Moving the base reformats the store once on the first boot: saved patterns
+// from before the move are lost, deliberately. The SPM flash service's write
+// window is narrowed to match (flash_service.c), so a stale app that still
+// thinks the arena starts lower now gets its writes REFUSED rather than
+// allowed to erase translated code out from under the running emulator.
+static constexpr uint16_t FE_ARENA_FIRST_PAGE = 0x17E;
+static constexpr uint16_t FE_BANK_PAGES       = 49;           // pages per bank
 static constexpr uint16_t FE_NUM_BANKS        = 2;
-static constexpr uint16_t FE_RECORD_PAGES     = FE_BANK_PAGES - 1; // 127 usable
+static constexpr uint16_t FE_RECORD_PAGES     = FE_BANK_PAGES - 1; // 48 usable
 static constexpr uint16_t FE_PAGE             = 256;
 
 // Logical block-id space (808): 32 patterns (16 STEP buttons x A/B) + 12 rhythm
@@ -80,6 +97,21 @@ public:
     if (append_ > FE_RECORD_PAGES) {            // active bank full
       if (!gc()) return false;
     }
+    return append_record(id, src, len, active_gen_, /*advance_seq=*/true);
+  }
+
+  // Split of write() for callers that hold a large serialization buffer on the
+  // stack (the pattern-push path: flash_pat_write's buf[FE_MAX_PAYLOAD]=243).
+  // Calling write() there stacks that 243-byte buffer under gc()'s 147-byte frame
+  // and overflows the combined build's stack (claim-016). Run gc_if_full() FIRST,
+  // in the caller's shallow frame before the buffer exists, then append_only()
+  // which never calls gc -- so buf and gc are never live at the same time.
+  bool gc_if_full() {
+    if (append_ > FE_RECORD_PAGES) return gc();
+    return true;
+  }
+  bool append_only(uint8_t id, const uint8_t *src, uint8_t len) {
+    if (id >= FE_MAX_BLOCKS || len > FE_MAX_PAYLOAD) return false;
     return append_record(id, src, len, active_gen_, /*advance_seq=*/true);
   }
 
@@ -242,14 +274,17 @@ private:
       read_(page_of(active_bank_, live[id]), scratch_);
       uint8_t len;
       if (!parse_record(scratch_, id, active_gen_, &len)) continue; // skip unreadable
-      uint8_t payload[FE_MAX_PAYLOAD];
-      memcpy(payload, scratch_ + FE_REC_HDR, len);
-      // Write into spare with the NEW generation.
+      // Rebuild the record header IN PLACE, keeping the payload where read_() left
+      // it in scratch_ (same id, same len, same offset FE_REC_HDR in the new
+      // record, so it does not move). Avoids a 243-byte payload[] stack local:
+      // gc() is reached through write() on the pattern-push path, so the whole
+      // chain superos_loop -> handle_sysex -> flash_pat_write -> write -> gc must
+      // fit the combined build's stack (claim-016). Removing this temp costs no
+      // RAM, unlike a member buffer which would just move the overflow.
       uint32_t s = ++seq_;
-      memset(scratch_, 0xFF, FE_PAGE);
       scratch_[0] = FE_REC_TAG; scratch_[1] = id;
       fe_wr32(scratch_ + 2, s); scratch_[6] = len; fe_wr32(scratch_ + 7, new_gen);
-      memcpy(scratch_ + FE_REC_HDR, payload, len);
+      memset(scratch_ + FE_REC_HDR + len, 0xFF, FE_PAGE - FE_REC_HDR - len);
       uint16_t crc = fe_crc16(0xFFFF, scratch_ + 1, 10);
       crc = fe_crc16(crc, scratch_ + FE_REC_HDR, len);
       scratch_[11] = crc; scratch_[12] = crc >> 8;
