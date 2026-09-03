@@ -301,6 +301,13 @@ input[type="file"] { display: none; }
       </div>
     </div>
     <div class="group">
+      <span class="lbl">On device</span>
+      <div class="group-inner">
+        <button class="btn" id="btnRandDev" title="Let the 808 itself randomize the selected pattern (SysEx 0x2E, every instrument), then read it back">Randomize</button>
+        <input type="number" id="randDensity" min="0" max="127" value="40" style="width:54px" title="On-device density 0-127: chance that a step is hit (0x2E)">
+      </div>
+    </div>
+    <div class="group">
       <span class="lbl">To 808</span>
       <div class="group-inner">
         <button class="btn btn-primary" id="btnSendPat" disabled>&#8593; Pattern</button>
@@ -406,7 +413,9 @@ input[type="file"] { display: none; }
     <div class="panel-body" id="body-fw">
       <div class="panel-inner">
         <p class="note">Power the 808 on with <b>STEP 1</b> held to enter the bootloader &mdash; step
-          LEDs 1-4 blink twice, then step 1 stays lit. Do not power off mid-transfer.</p>
+          LEDs 1-4 blink twice, then step 1 stays lit &mdash; or, from a running SuperOS, click
+          <b>Enter bootloader via MIDI</b> (SysEx 0x4A). Do not power off mid-transfer.</p>
+        <button class="btn" id="btnBoot" title="Ask the running SuperOS firmware to reboot into its SysEx bootloader (0x4A); no panel access needed">Enter bootloader via MIDI</button>
         <button class="btn" id="btnFwLoad">&#8593; Load .syx</button>
         <input type="file" id="fileFw" accept=".syx">
         <span id="fwStatus" class="cal-val" style="color:var(--gray-3)">no file loaded</span>
@@ -1318,6 +1327,26 @@ $('selIn').onchange = () => { if(portIn) connect(); };
 $('selOut').onchange = () => { if(portOut) connect(); };
 
 $('btnReq').onclick    = () => sendCmd(0x10, [patIndex()]);
+// Fleet RANDOMIZE opcode (0x2E <pat> <lane> <density> <seed_lo> <seed_hi>): lane
+// 0x7F = every instrument, seed 0 = device entropy. Read back rather than guessed.
+$('btnRandDev').onclick = () => {
+  if (!portOut) { log('randomize skipped: no MIDI output', 'log-err'); return; }
+  let d = parseInt($('randDensity').value, 10);
+  if (isNaN(d)) d = 40;
+  d = Math.max(0, Math.min(127, d));
+  sendCmd(0x2E, [patIndex(), 0x7F, d, 0, 0]);
+  log('asked the 808 to randomize the pattern (0x2E, density ' + d + ')', 'log-note');
+  setTimeout(() => sendCmd(0x10, [patIndex()]), 200);
+};
+// 0x4A: reboot a running SuperOS into the SysEx bootloader, so no STEP 1 power-on
+// combo is needed. The bootloader re-enumerates, so reconnect (or use SysEx
+// Librarian / MIDI-OX) before sending the firmware.
+$('btnBoot').onclick = () => {
+  if (!portOut) { log('bootloader jump skipped: no MIDI output', 'log-err'); return; }
+  if (!confirm('Reboot the 808 into its SysEx bootloader now? Patterns are untouched. Reconnect MIDI afterwards, then send the firmware.')) return;
+  sendCmd(0x4A);
+  log('asked the 808 to reboot into the bootloader (0x4A); reconnect MIDI, then send the firmware', 'log-note');
+};
 $('btnReqAll').onclick = reqAll;
 $('btnSendPat').onclick = () => {
   const raw = serializePattern(curPat());
