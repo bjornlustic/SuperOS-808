@@ -2,6 +2,52 @@
 
 Notable changes per release. Dates are release dates.
 
+## v0.4 — 2026-10-14
+
+### Added
+
+**Rhythm tracks, intros and fills behave like the stock TR-808.** Every rule was measured
+by running the 1981 program in the emulator. RECORD memorizes fills, intros and auto fills
+as measures, and the measure STOP lands in is the last; past 64 measures a recording rolls
+into the next track and playback follows it. EDIT replays the track and overwrites only
+the measures you change. PLAY loops from measure 1; a key changes the next measure for one
+pass without saving, and the TRACK dial moved while playing applies at the loop point. A
+pattern key or TAP inside the first beat of a measure acts on that measure, heard from the
+second beat. AUTO FILL IN now works on every panel: it uses the stock program's decode,
+makes every Nth measure a fill (setting 2 is B F B F), counts fills and not the intro, and
+AB keeps alternating through fills.
+
+**PLAY and COMPOSE told apart.** The panel gives the CPU one code for both detents, as it
+did the stock CPU, which separated them through the MODE switch's memory-protect deck.
+With that deck wired to the CPU (PI0), superOS reads it: PLAY never writes, COMPOSE edits
+on START and records on CLEAR, START. Without the wire both detents act as PLAY and the
+CLEAR gestures arm record (CLEAR, START) or edit (CLEAR twice, START) in either.
+
+**Four MIDI switches.** Config menu steps 3, 4, 13 and 14 turn SysEx in, SysEx out, notes
+in and notes out off independently (lit = off). Notes in off leaves program change and bank
+select working. SysEx in off ignores every SysEx, the one that would switch it back on
+included, so only step 3 re-enables it. The web editor shows and sets all four.
+
+**LENGTH deletes a part.** Pressing the count a part already has sets it to zero, so a 2nd
+part (or section 3 or 4) made by a stray press can be removed from the panel. The 1st part
+is exempt.
+
+### Fixed
+
+**A clock master on USB and the MIDI jack at once ran the 808 at double tempo.** Clock and
+transport now come from one port at a time, on both firmwares: the port that sent the last
+real-time byte owns them until it has been quiet for half a second.
+
+**Incoming MIDI clock is smoothed,** so USB delivery jitter and burst batching stay out of
+the timing, while every clock still moves the sequencer exactly one tick.
+
+**A master that sends Start and its first clock together (an MPC Live) made the 808 play
+one clock late** on most starts. The smoother is now reset only when the clock goes away,
+not when it arrives.
+
+**The bass drum was silent on boards that route its data line through a path selector.**
+The firmware now selects the direct path at power-on.
+
 ## v0.3 — 2026-08-26
 
 The baseline release: every feature below has been exercised on a real machine,

@@ -43,7 +43,7 @@ static inline bool usb_sof_alive() {
 // dodge the check is explicitly not allowed either. Clearing DETACH on a board
 // with no VBUS sense leaves the device invisible: the host never sees a
 // pull-up, never drives a bus reset, and EORSTI never fires. Diagnosed exactly
-// that way on an MSW board, 2026-08-24. Fix the wire; do not add a bypass.
+// that way on one board, 2026-08-24. Fix the wire; do not add a bypass.
 static inline void usb_vbus_gate() {
   // Boot settle: stay parked for the first 150 ms even with a cable in, so
   // setup()-time scans and init run with the engine off.

@@ -6,7 +6,7 @@ the machine's original NEC µPD650C processor — any AT90USB1286 board in the �
 stock CPU used. Nothing on the analog side is modified, so the drum voices sound exactly like
 a stock 808.
 
-**Status: this is the baseline release.** It runs on hardware, and the panel layer — every
+**Status: v0.4.** It runs on hardware, and the panel layer — every
 gesture, tool, and menu — is machine-verified by an automated harness that presses the keys
 over SysEx and reads the state back. A `combined` build also carries an emulator of the
 stock µPD650C-085, so one board boots either the original behaviour or the extended one.
@@ -19,8 +19,16 @@ stock µPD650C-085, so one board boots either the original behaviour or the exte
   that's how 20-step and other odd measures are written.
 - **PRE SCALE** sets steps per beat: 3, 6, 4 or 8.
 - **TAP** inserts intros and fills in the play modes and writes steps in real time in the
-  write modes. **AUTO FILL IN** drops a fill every 2/4/8/12/16 measures.
-- **COMPOSE** records a rhythm track live — 12 tracks × 64 measures.
+  write modes. Inside the first beat of a measure it turns that measure into the fill.
+  **AUTO FILL IN** drops a fill every 2/4/8/12/16 measures; fills count toward N, an intro
+  does not, and AB keeps alternating through fills.
+- **Rhythm tracks**, 12 × 64 measures. PLAY plays a track from measure 1 and loops; COMPOSE
+  records it live (CLEAR, then START: every pattern, fill, intro and auto fill is
+  memorized) or edits it in place (START: the keys overwrite the measures they land in).
+  The panel gives the CPU one code for both detents; with the Play/Compose wire fitted
+  (the MODE switch's memory-protect deck read on PI0) superOS tells them apart as stock,
+  and without it both act as PLAY, CLEAR then START records and CLEAR twice then START
+  edits.
 
 Nothing superOS adds moves a stock control. START/STOP, TAP and FILL IN keep their factory
 behaviour in every mode.
@@ -39,8 +47,11 @@ in MANUAL PLAY — for as long as the button is down. A step press latches that 
   own rate, against the pattern. All of it saved with the pattern.
 - **Swing**, pattern **direction**, live **mutes**, momentary **reslice**, an **arp**,
   pattern **generate**, **copy/paste**, **transform**, chained slots drawn on the LEDs.
-- **MIDI in/out**: the voices on the GM drum map (velocity ≥ 100 accents), program change
-  for pattern selection (0–15 = A, 16–31 = B), clock sync as slave or master, soft thru.
+- **MIDI in/out** over the MIDI jacks and USB-C: the voices on the GM drum map
+  (velocity ≥ 100 accents), program change for pattern selection (0–15 = A, 16–31 = B),
+  clock sync as slave or master with jitter smoothing, soft thru. Clock follows one port at
+  a time, so a master on both does not double the tempo. Four config-menu switches turn
+  SysEx in, SysEx out, notes in and notes out off independently.
 - A **web editor** over SysEx (`tools/web-editor/index.html`): live two-way pattern grid,
   file backup, settings, panel calibration, firmware and program-image upload.
 - **Firmware updates over the 808's own MIDI IN** — no disassembly after the first install.
@@ -90,8 +101,9 @@ step 8) and the measured table is stored to flash.
 
 ## Manual
 
-The full Owner's Manual (v0.3) covers every gesture, tool and menu item, and ships with
-each release.
+The full Owner's Manual (v0.4) covers every gesture, tool and menu item:
+[superos303.com/doc/808](https://superos303.com/doc/808), with a PDF and a one-page-per-function
+Shortcut Guide there too.
 
 ---
 

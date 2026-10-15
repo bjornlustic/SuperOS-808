@@ -252,7 +252,7 @@ static uint16_t run_chunk(ucom4_t *c, uint16_t cycles) {
 #endif
     step_cyc = 0;
 #ifdef UCOM4_PC_PROFILE
-    // Where does the ROM actually spend its cycles? 32 buckets of 64 program
+    // Where does the program actually spend its cycles? 32 buckets of 64 program
     // bytes. Bench only, and it costs throughput while enabled: the point is
     // to aim high-level emulation at the right loop instead of guessing.
     ucom4_pc_hist[(pc >> 6) & 31]++;
