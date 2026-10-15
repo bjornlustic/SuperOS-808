@@ -17,12 +17,16 @@
 //   - BASIC VARIATION A / B / AB, where AB alternates measures always starting
 //     on A, and a variation change takes effect "on the first beat of the
 //     following measure" (OM p.12)
-//   - INTRO/FILL IN: TAP arms an intro when stopped, or inserts a one-measure
-//     fill at the end of the current measure when running; AUTO FILL IN inserts
-//     one every 2/4/8/12/16 measures, and an intro is not counted in that
-//     measure tally (OM pp.11-12)
+//   - INTRO/FILL IN: TAP arms an intro when stopped, or makes the next measure
+//     a fill when running; AUTO FILL IN makes every Nth measure (N = 2/4/8/12/
+//     16) a fill, and an intro is not counted in that tally (OM pp.11-12)
+//   - the FIRST BEAT of a 1st part is a window: a pattern key or TAP pressed
+//     inside it acts on the CURRENT measure from the second beat, instead of
+//     on the next measure (OM p.11)
 //   - rhythm tracks store pattern SLOTS, not variations, so the live variation
 //     switch applies on playback (OM p.19)
+// The fill, window and track rules were measured off the 1981 program running
+// in the host emulator, not only read from the manual: tools/d650/rtrack_probe.
 #pragma once
 #include <Arduino.h>
 #include "pins.h"
@@ -194,42 +198,59 @@ using PatPatchFn = bool (*)(uint8_t idx, uint8_t off, const uint8_t *src, uint8_
 using PatClearFn = bool (*)(uint8_t idx);
 
 class Engine {
+  // NO ZERO-VALUED MEMBER INITIALIZERS in this class. The one Engine that
+  // ships is a static (`eng`, main.cpp), so it is zero before any constructor
+  // runs, and each `= 0` here compiled to a 4-byte store in the static
+  // initializer: 81 of them, about 330 B of a flash budget measured in
+  // hundreds. Only non-zero defaults are written below. The price is the rule
+  // for every other Engine: construct it static or VALUE-initialized,
+  // `Engine e{};`, which zero-fills first. A bare `Engine e;` on the stack
+  // starts with garbage in every field that used to read `= 0`.
  public:
   Track track[NUM_TRACKS];      // tracks stay RAM-resident (12 x 65 B)
 
   // ---- playback state ----
-  bool    running     = false;
-  bool    track_play  = false;  // started with the MODE dial in PLAY
-  bool    track_write = false;  // started with the MODE dial in COMPOSE
-  uint8_t cur_pat     = 0;      // absolute pattern index 0..31 (playing / editing)
+  bool    running;
+  // The rhythm-track transport, as two independent facts:
+  //   track_play   the measure sequence comes FROM the track (PLAY, EDIT)
+  //   track_write  measures are written INTO the track     (RECORD, EDIT)
+  // Both set is EDIT: the stock COMPOSE started without CLEAR, which replays
+  // the track and overwrites the measures the player switches (OM p.20).
+  bool    track_play;
+  bool    track_write;
+  uint8_t cur_pat;           // absolute pattern index 0..31 (playing / editing)
   int8_t  step        = -1;     // sounding step 0..63, -1 = before the first
-  uint8_t cur_track   = 0;
-  uint8_t track_pos   = 0;
+  uint8_t cur_track;
+  uint8_t track_pos;
+  // The track a playing run loops back to. Start sets it to cur_track; the
+  // INSTRUMENT/TRACK dial moved while running writes it, so the change lands
+  // at the loop point, which is where the stock program takes it.
+  uint8_t loop_track;
 
   uint8_t pending_prescale = 0xFF;  // PRE SCALE armed for the next commit
 
   // ---- panel performance state ----
-  uint8_t sel_slot   = 0;        // the STEP button that is selected (0..15)
-  uint8_t variation  = VAR_A;    // BASIC VARIATION dial
-  bool    if_var_b   = false;    // I/F VARIATION dial (no AB position on the 808)
-  uint8_t fill_every = FILL_MANUAL;
+  uint8_t sel_slot;           // the STEP button that is selected (0..15)
+  uint8_t variation;      // BASIC VARIATION dial
+  bool    if_var_b;       // I/F VARIATION dial (no AB position on the 808)
+  uint8_t fill_every;
   uint8_t fill_slot  = NUM_BASIC;   // which INTRO/FILL IN (slot 12..15) is armed
-  bool    intro_armed = false;   // TAP pressed while stopped: play the fill first
-  bool    fill_request = false;  // TAP pressed while running: fill the next measure
-  uint16_t measure   = 0;        // measures of BASIC rhythm played this run
+  bool    intro_armed;    // TAP pressed while stopped: play the fill first
+  bool    fill_request;   // TAP pressed while running: fill the next measure
+  uint16_t measure;           // measures played this run, fills included, the intro not
 
   // ---- pattern chain (a SuperOS addition to MANUAL PLAY) ----
   uint8_t chain[CHAIN_MAX];
-  uint8_t chain_len = 0;
-  uint8_t chain_pos = 0;
+  uint8_t chain_len;
+  uint8_t chain_pos;
   uint8_t queued[CHAIN_MAX];
-  uint8_t queue_len = 0;
+  uint8_t queue_len;
 
-  uint16_t dirty_trk = 0;       // bit per track (12 tracks needs 16 bits)
-  bool     step_advanced = false;
+  uint16_t dirty_trk;        // bit per track (12 tracks needs 16 bits)
+  bool     step_advanced;
 
   // ---- SuperOS performance state (runtime; not persisted) ----
-  uint8_t  play_dir   = DIR_FWD;
+  uint8_t  play_dir;
   // Per-voice play direction (claim-119). 0xFF = follow the master.
   //
   // ENGINE STATE, not a Pattern field, and that is a deliberate match rather
@@ -245,17 +266,17 @@ class Engine {
   // this many steps on ALL patterns, which is what lets a chain of differently
   // written patterns run to one bar. Runtime only and never persisted, exactly
   // as on the 606 — it is a performance override, not part of a pattern.
-  uint8_t  global_len = 0;
-  uint16_t mute_mask  = 0;      // bit per Instrument, 1 = muted (bit0 = accent)
+  uint8_t  global_len;
+  uint16_t mute_mask;        // bit per Instrument, 1 = muted (bit0 = accent)
   // RESLICE: the window in steps, 0 = off. ONE field, because a flag beside a
   // window is two encodings of one fact and they drift apart at the edges: the
   // old ResliceOff() cleared the flag and left the window set, and 0x45
   // publishes the window on its own byte, so a host polling runtime state read
   // a window that was not in effect. It also made `on && len == 0` sayable,
   // which main.cpp's LED frame turns into led_bit(255).
-  uint8_t  reslice_len = 0;
+  uint8_t  reslice_len;
   uint8_t  arp[16];
-  uint8_t  arp_len = 0;
+  uint8_t  arp_len;
 
   void SetPatIO(PatReadFn r, PatWriteFn w, PatPeekFn pk = nullptr,
                 PatPatchFn pt = nullptr, PatClearFn pc = nullptr) {
@@ -393,7 +414,7 @@ class Engine {
   void SetVariation(uint8_t v) {
     if (v == variation) return;
     variation = v;
-    if (!running) { resolve_pattern_(); latch_prescale(); }
+    if (!running) repoint_();
   }
 
   // ---- pattern cache --------------------------------------------------------
@@ -594,27 +615,30 @@ class Engine {
     memset(poly_pos_, 0, sizeof(poly_pos_));
     rng_ ^= (uint32_t)micros() | 1u;
 
+    beat_pend_  = false;
+    ovr_slot_   = 0xFF;
+    track_pos   = 0;
+    loop_track  = cur_track;
     if (track_play) {
-      track_pos = 0;
-      if (track[cur_track].len > 0) sel_slot = track[cur_track].pat(0);
+      // Always from measure 1, including after a mid-track stop. An empty
+      // track plays pattern 1, as the stock program does.
+      sel_slot = track[cur_track].pat(0);
     } else if (track_write) {
-      // COMPOSE records in real time from measure 1; the operator clears the
-      // track first (OM p.19).
-      track_pos = 0;
-      track[cur_track].Clear();
-      mark_trk_dirty(cur_track);
+      // RECORD: CLEAR then START writes from measure 1 (OM p.19).
+      TrackClear();
     } else {
       chain_pos = 0;
       if (chain_len > 0) sel_slot = pat_slot(chain[0]);
     }
 
     // An armed INTRO plays first, once, before the basic rhythm (OM p.11).
-    fill_now_ = intro_armed;
+    // Stock PLAY ignores it (and AUTO FILL IN); RECORD plays and records it.
+    fill_now_  = intro_armed && !track_play;
+    intro_now_ = fill_now_;
     intro_armed = false;
     fill_request = false;
-    resolve_pattern_();
-    latch_prescale();
-    if (track_write) record_measure_();
+    repoint_();
+    if (rec_()) record_measure_();
   }
 
   void Stop() {
@@ -625,7 +649,7 @@ class Engine {
     tick_       = 0;
     queue_len   = 0;
     reslice_len = 0;
-    fill_now_   = false;
+    fill_now_   = false;          // intro_now_/beat_pend_/ovr_slot_: Start sets them
     fill_request = false;
     memset(rat_rem_, 0, sizeof(rat_rem_));
     arp_len  = 0;
@@ -846,7 +870,7 @@ class Engine {
   }
   void ClearInstDirs() { memset(idir, 0xFF, sizeof(idir)); }
 
-  bool master_poly = false;
+  bool master_poly;
   // Two bytes of each of 32 patterns. This used to read, edit and write back a
   // whole 228-byte record per pattern, which put the deepest chain on the
   // machine above a flash write (claim-080: 570 B before its callers were even
@@ -1027,11 +1051,24 @@ class Engine {
 
   // ---- INTRO / FILL IN ------------------------------------------------------
   // TAP while STOPPED arms the selected INTRO/FILL IN to play first, as an
-  // intro; pressing it again cancels. TAP while RUNNING queues a one-measure
-  // fill that takes over at the end of the current measure (OM pp.11-12).
+  // intro; pressing it again cancels (OM p.11).
+  //
+  // TAP while RUNNING, as the stock program does it:
+  //   inside the first beat   the CURRENT measure becomes the fill, heard from
+  //                           the second beat; in RECORD and EDIT the fill is
+  //                           what the track stores for this measure
+  //   after it                the NEXT measure is the fill (MANUAL PLAY and
+  //                           RECORD); ignored when the track is playing
+  //                           (PLAY, EDIT), where the track owns the next measure
   void TapFill() {
-    if (running) fill_request = true;
-    else         intro_armed = !intro_armed;
+    if (!running) { intro_armed = !intro_armed; return; }
+    if (in_first_beat_()) {
+      fill_now_  = true;
+      beat_pend_ = true;
+      if (track_write) rewrite_measure_(fill_slot);
+    } else if (!track_play) {
+      fill_request = true;
+    }
   }
   void SelectFillSlot(uint8_t slot) {
     if (slot >= NUM_BASIC && slot < NUM_SLOTS) fill_slot = slot;
@@ -1046,8 +1083,7 @@ class Engine {
     sel_slot = slot;
     if (slot_is_fill(slot)) fill_slot = slot;
     fill_now_ = false;
-    resolve_pattern_();
-    latch_prescale();
+    repoint_();
   }
   bool FillPlaying() const { return fill_now_; }
 
@@ -1096,23 +1132,35 @@ class Engine {
   // the new Rhythm is selected on the first beat of the measure the new Rhythm
   // will begin on the second beat of that same measure" (OM p.11). pos_ == 0 is
   // that first beat.
+  //
+  // The stock program's "first beat" is a window of 24 tempo ticks at the
+  // head of the 1st part, and a press inside it is HEARD from the first step
+  // after the window but counts as the whole measure: that is what a track
+  // records for it (OM p.20, "Notes on Composing").
   void SelectSlot(uint8_t slot) {
     if (slot >= NUM_SLOTS) return;
-    if (slot_is_fill(slot)) { SelectFillSlot(slot); return; }
+    if (slot_is_fill(slot)) {
+      SelectFillSlot(slot);       // the last one pressed is the TAP fill
+      if (!track_play) return;    // PLAY/EDIT: it is also a track measure
+    }
     if (!running) {
       sel_slot  = slot;
       chain_len = 0;
       chain_pos = 0;
       queue_len = 0;
-      resolve_pattern_();
-      latch_prescale();
-    } else if (pos_ == 0) {
+      repoint_();
+    } else if (in_first_beat_()) {
       sel_slot  = slot;
+      fill_now_ = false;
       chain_len = 0;
       queue_len = 0;
-      resolve_pattern_();
-      latch_prescale();
-      if (track_write) record_measure_();   // rewrite this measure's entry
+      ovr_slot_ = 0xFF;
+      beat_pend_ = true;
+      if (track_write) rewrite_measure_(slot);
+    } else if (track_play) {
+      // PLAY / EDIT: keys 1-16 replace the NEXT measure of the track for one
+      // pass; EDIT also writes it (OM p.20), PLAY only plays it.
+      ovr_slot_ = slot;
     } else {
       queued[0] = slot;
       queue_len = 1;
@@ -1125,8 +1173,7 @@ class Engine {
       chain_len = n;
       chain_pos = 0;
       sel_slot  = chain[0];
-      resolve_pattern_();
-      latch_prescale();
+      repoint_();
     } else {
       memcpy(queued, slots, n);
       queue_len = n;
@@ -1144,7 +1191,8 @@ class Engine {
   }
 
   void mark_pat_dirty(uint8_t p) { if (p == cache_idx_) cache_dirty_ = true; }
-  void mark_trk_dirty(uint8_t t) { dirty_trk |= (uint16_t)1 << t; }
+  // Out of line: the variable 16-bit shift inlined at seven sites cost 40 B.
+  __attribute__((noinline)) void mark_trk_dirty(uint8_t t) { dirty_trk |= (uint16_t)1 << t; }
 
   uint16_t fired() const { return fired_; }
   bool fired_accent() const { return fired_accent_; }
@@ -1152,10 +1200,10 @@ class Engine {
   uint8_t position() const { return pos_; }
 
  private:
-  uint8_t  tick_       = 0;
-  uint8_t  pos_        = 0;     // position within the measure, 0..total_len-1
+  uint8_t  tick_;
+  uint8_t  pos_;             // position within the measure, 0..total_len-1
   bool     first_      = true;
-  bool     pp_back_    = false;
+  bool     pp_back_;
   // claim-042. The note bits live in steps[inst][sec], but ratchet and
   // probability are SPARSE maps keyed by ABSOLUTE step, so a permutation that
   // moves only the bits strands them: the attribute stays on a step the hit has
@@ -1262,12 +1310,15 @@ class Engine {
 
   uint32_t rng_        = 0x808a55edUL;
   uint8_t  active_pre_ = 2;
-  bool     fill_now_   = false; // this measure is playing an intro/fill
-  bool     master_poly_owed_ = false;  // claim-118: store patch owed to a stop
-  bool     poly_resync_      = false;  // claim-118: realign on the next step
-  uint8_t  ab_phase_   = 0;     // AB variation: 0 = A measure, 1 = B measure
-  uint8_t  ind_var_    = VAR_A;
-  bool     ind_part2_  = false;
+  bool     fill_now_;    // this measure is playing an intro/fill
+  bool     intro_now_;   // ...and it is the intro, which AUTO FILL IN does not count
+  bool     beat_pend_;   // a first-beat switch, heard from the window's end
+  uint8_t  ovr_slot_   = 0xFF;  // PLAY/EDIT key: the next measure's slot, one pass
+  bool     master_poly_owed_;   // claim-118: store patch owed to a stop
+  bool     poly_resync_;        // claim-118: realign on the next step
+  uint8_t  ab_phase_;        // AB variation: 0 = A measure, 1 = B measure
+  uint8_t  ind_var_;
+  bool     ind_part2_;
 
   uint8_t rng_u8() { rng_ = rng_ * 1664525UL + 1013904223UL; return (uint8_t)(rng_ >> 24); }
 
@@ -1395,6 +1446,14 @@ class Engine {
     if (p == &cache_) cache_dirty_ = true;
   }
 
+  // Re-point at the addressed pattern and take its PRE SCALE. Out of line on
+  // purpose: latch_prescale inlines the pattern-cache loader, and each inlined
+  // copy of the pair cost about a kilobyte of a budget measured in hundreds.
+  __attribute__((noinline)) void repoint_() {
+    resolve_pattern_();
+    latch_prescale();
+  }
+
   // Point cur_pat at the pattern the panel currently addresses.
   void resolve_pattern_() {
     if (fill_now_) {
@@ -1408,22 +1467,46 @@ class Engine {
     cur_pat = pat_index(v, sel_slot);
   }
 
-  void record_measure_() {
-    Track &t = track[cur_track];
-    if (t.len >= TRACK_MAX_PATS) {
-      // "Once you have used up the memory available in one position the TR-808
-      // automatically switches to the next track" (OM p.4).
-      if (cur_track + 1 < NUM_TRACKS) {
-        cur_track = (uint8_t)(cur_track + 1);
-        track[cur_track].Clear();
-        mark_trk_dirty(cur_track);
-      } else {
-        return;   // last track full: stop recording rather than wrap
-      }
-    }
-    Track &d = track[cur_track];
-    d.set_pat(d.len++, sel_slot);
+  // Recording a fresh track, not editing one.
+  bool rec_() const { return track_write && !track_play; }
+
+  // Stock timing window: the first 24 tempo ticks (one beat) of the 1st part,
+  // with `ticks` into the current step. cache_ and not cur(): while running
+  // the sounding pattern is always the cached one, and cur() inlined here cost
+  // over a kilobyte.
+  bool first_beat_at_(uint8_t ticks) const {
+    return pos_ < cache_.seclen[0] &&
+           (uint16_t)pos_ * PRESCALE_TICKS[active_pre_] + ticks < 24;
+  }
+  void take_beat_switch_() {
+    if (first_beat_at_(0)) return;
+    beat_pend_ = false;
+    repoint_();
+  }
+  bool in_first_beat_() const {
+    return !running || step < 0 || first_beat_at_(tick_);
+  }
+
+  // The current measure's track entry, rewritten in place (never appended).
+  // track_pos is the current measure in every track mode, RECORD included.
+  __attribute__((noinline)) void rewrite_measure_(uint8_t slot) {
+    track[cur_track].set_pat(track_pos, slot);
     mark_trk_dirty(cur_track);
+  }
+
+  // Append this measure (the fill slot if a fill is sounding) to the track.
+  void record_measure_() {
+    if (track[cur_track].len >= TRACK_MAX_PATS) {
+      // "Once you have used up the memory available in one position the TR-808
+      // automatically switches to the next track" (OM p.4). The full track is
+      // marked to run on into it, as the stock program marks it.
+      if (cur_track + 1 >= NUM_TRACKS) return;   // last track full: stop recording
+      track[cur_track].cont = 1;                 // already dirty: we wrote it
+      ++cur_track;
+      TrackClear();
+    }
+    track_pos = track[cur_track].len++;
+    rewrite_measure_(fill_now_ ? fill_slot : sel_slot);
   }
 
   uint8_t eff_len_() {
@@ -1476,35 +1559,35 @@ class Engine {
     return (uint8_t)(base + d);
   }
 
-  bool     pulse_on_     = false;
-  uint32_t pulse_t0_     = 0;
-  uint16_t pulse_mask_   = 0;
-  bool     pulse_accent_ = false;
-  uint16_t gather_mask_   = 0;
-  bool     gather_accent_ = false;
-  bool     gather_active_ = false;
-  uint32_t gather_last_   = 0;
-  uint16_t fired_        = 0;
-  bool     fired_accent_ = false;
+  bool     pulse_on_;
+  uint32_t pulse_t0_;
+  uint16_t pulse_mask_;
+  bool     pulse_accent_;
+  uint16_t gather_mask_;
+  bool     gather_accent_;
+  bool     gather_active_;
+  uint32_t gather_last_;
+  uint16_t fired_;
+  bool     fired_accent_;
   Pattern  copy_buf_;
 
   Pattern    cache_;
   uint8_t    cache_idx_   = 0xFF;
-  bool       cache_dirty_ = false;
-  PatReadFn  pat_read_    = nullptr;
-  PatWriteFn pat_write_   = nullptr;
-  PatPeekFn  pat_peek_  = nullptr;
-  PatPatchFn pat_patch_ = nullptr;
-  PatClearFn pat_clear_ = nullptr;
-  bool       pend_valid_  = false;
-  uint8_t    pend_idx_    = 0;
+  bool       cache_dirty_;
+  PatReadFn  pat_read_;
+  PatWriteFn pat_write_;
+  PatPeekFn  pat_peek_;
+  PatPatchFn pat_patch_;
+  PatClearFn pat_clear_;
+  bool       pend_valid_;
+  uint8_t    pend_idx_;
   Pattern    pend_pat_;
 
   // One bit per pattern: "this pattern's layout is stale, copy its partner's
   // onto it". Set by mirror_layout_to_sibling_, drained by ServiceLayoutSync.
   // NUM_PATTERNS is 32, so the mask is exactly a uint32_t; the static_assert
   // keeps that honest if the slot count ever moves.
-  uint32_t   layout_sync_req_ = 0;
+  uint32_t   layout_sync_req_;
   static_assert(NUM_PATTERNS <= 32, "layout_sync_req_ is a 32-bit mask");
 
   void flush_() {
@@ -1512,17 +1595,17 @@ class Engine {
     cache_dirty_ = false;
   }
 
-  uint8_t  rat_rem_[NUM_INSTRUMENTS]      = {0};
-  uint32_t rat_sp_us_[NUM_INSTRUMENTS]    = {0};
-  uint32_t rat_next_us_[NUM_INSTRUMENTS]  = {0};
-  bool     rat_accent_    = false;
+  uint8_t  rat_rem_[NUM_INSTRUMENTS];
+  uint32_t rat_sp_us_[NUM_INSTRUMENTS];
+  uint32_t rat_next_us_[NUM_INSTRUMENTS];
+  bool     rat_accent_;
   uint32_t tick_us_       = 20833;   // 24-PPQN period, 120 BPM default
-  uint8_t  reslice_start_ = 0;
-  uint8_t  reslice_off_   = 0;
-  uint8_t  arp_pos_       = 0;
-  uint8_t  poly_pos_[NUM_INSTRUMENTS] = {0};
-  uint8_t  vtick_[NUM_INSTRUMENTS]    = {0};   // claim-124: ticks to this
-  uint8_t  vpos_[NUM_INSTRUMENTS]     = {0};   // voice's next step, and where
+  uint8_t  reslice_start_;
+  uint8_t  reslice_off_;
+  uint8_t  arp_pos_;
+  uint8_t  poly_pos_[NUM_INSTRUMENTS];
+  uint8_t  vtick_[NUM_INSTRUMENTS];       // claim-124: ticks to this
+  uint8_t  vpos_[NUM_INSTRUMENTS];        // voice's next step, and where
 
   void latch_prescale() {
     if (pending_prescale != 0xFF) {
@@ -1578,18 +1661,31 @@ class Engine {
   }
 
   void on_wrap() {
-    const bool was_fill = fill_now_;
+    const bool was_fill  = fill_now_;
+    const bool was_intro = intro_now_;
+    intro_now_ = false;
+    beat_pend_ = false;           // the measure is over; on_wrap resolves anyway
 
-    // An intro/fill plays exactly once and then hands back to the basic rhythm.
-    // Intros are not counted in the AUTO FILL IN measure tally (OM p.12), and
-    // neither is a fill measure itself.
-    if (!was_fill) ++measure;
+    // Every measure counts toward AUTO FILL IN, fills included; the intro does
+    // not (OM p.12). Measured: setting 2 plays B F B F, and a TAP fill takes a
+    // place in the count rather than shifting it.
+    if (!was_intro) ++measure;
 
     if (track_play) {
-      const Track &t = track[cur_track];
-      if (t.len > 0 && !was_fill) {
-        if (++track_pos >= t.len) track_pos = 0;
-        sel_slot = t.pat(track_pos);
+      // A fill here only ever REPLACED a measure (TAP in the first beat), so
+      // the track advances regardless. At the end: run on into the next track
+      // if this one was composed past 64 measures, else loop to the track the
+      // run started on, or to the one the dial picked meanwhile.
+      if (++track_pos >= track[cur_track].len) {
+        track_pos = 0;
+        if (track[cur_track].cont && cur_track + 1 < NUM_TRACKS) ++cur_track;
+        else cur_track = loop_track;
+      }
+      sel_slot = track[cur_track].pat(track_pos);
+      if (ovr_slot_ != 0xFF) {
+        sel_slot = ovr_slot_;
+        ovr_slot_ = 0xFF;
+        if (track_write) rewrite_measure_(sel_slot);
       }
     } else if (queue_len > 0 && (chain_len == 0 || chain_pos + 1 >= chain_len)) {
       memcpy(chain, queued, queue_len);
@@ -1602,22 +1698,27 @@ class Engine {
       sel_slot = chain[chain_pos];
     }
 
-    // AB alternation advances one measure at a time, always starting on A
-    // (OM p.12). A fill measure does not advance the phase.
-    if (!was_fill && variation == VAR_AB) ab_phase_ ^= 1;
+    // AB alternation advances every measure, fills included, and starts on A
+    // after an intro (OM p.12; measured: setting 2 with AB never sounds B).
+    if (!was_intro && variation == VAR_AB) ab_phase_ ^= 1;
 
-    // AUTO FILL IN: insert a fill every N measures, or on demand from TAP.
-    const uint8_t every = FILL_MEASURES[fill_every < NUM_FILL_POS ? fill_every : 0];
-    fill_now_ = fill_request || (!was_fill && every && (measure % every) == 0);
+    // AUTO FILL IN: the measure about to play is number measure + 1, and every
+    // Nth one is a fill. Stock PLAY does not auto-fill: the track owns every
+    // measure.
+    const uint8_t every = track_play ? 0
+        : FILL_MEASURES[fill_every < NUM_FILL_POS ? fill_every : 0];
+    fill_now_ = fill_request || (every && (uint16_t)(measure + 1) % every == 0);
     fill_request = false;
 
-    resolve_pattern_();
-    latch_prescale();
+    repoint_();
 
-    if (track_write && !fill_now_) record_measure_();
+    if (rec_()) record_measure_();
   }
 
   void fire_step(uint8_t s) {
+    // A first-beat switch is heard from the first step after the window. Here
+    // and not in advance_step, where the same call cost 422 B of inlining.
+    if (beat_pend_) take_beat_switch_();
     const Pattern &p = cur();
     memset(rat_rem_, 0, sizeof(rat_rem_));
 

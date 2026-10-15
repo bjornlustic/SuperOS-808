@@ -22,10 +22,14 @@ static constexpr uint8_t FB_SETTINGS     = FB_TRACK_BASE + NUM_TRACKS; // 44
 static constexpr uint8_t FB_PANELMAP     = FB_SETTINGS + 1;            // 45
 static_assert(FB_PANELMAP < FE_MAX_BLOCKS, "block-id space overflowed");
 
-// FB_SETTINGS payload: magic, midi_channel, clock_source, out_mode. The magic
-// gates a blank/older block so a fresh device falls back to the struct defaults
-// instead of garbage.
-static constexpr uint8_t FB_SETTINGS_LEN = 4;
+// FB_SETTINGS payload: magic, then the settings.h codec (midi_channel,
+// clock_source, out_mode, legacy sysex_enable, io_mask). The magic gates a
+// blank/older block so a fresh device falls back to the struct defaults
+// instead of garbage. Every field after out_mode was APPENDED (sysex_enable
+// 2026-08-28, io_mask 2026-09-07), and settings_unpack takes the stored
+// length, so a 4- or 5-byte record from an older build still loads with the
+// missing switches defaulting to enabled.
+static constexpr uint8_t FB_SETTINGS_LEN = 1 + SETTINGS_VALUES;
 static constexpr uint8_t SETTINGS_MAGIC  = 0x96;
 
 // Page hooks: program via the boot SPM service, read via far program-memory reads.
@@ -171,19 +175,16 @@ inline void load_all(Engine &eng) {
 inline void __attribute__((noinline)) load_settings(Settings &s) {
   if (!g_flash_ok) return;
   uint8_t buf[FB_SETTINGS_LEN];
-  if (g_flash.read(FB_SETTINGS, buf, FB_SETTINGS_LEN) == FB_SETTINGS_LEN &&
-      buf[0] == SETTINGS_MAGIC) {
-    s.midi_channel = buf[1];
-    s.clock_source = buf[2];
-    s.out_mode     = buf[3];
-    s.sanitize();
-  }
+  const uint8_t got = g_flash.read(FB_SETTINGS, buf, FB_SETTINGS_LEN);
+  if (got >= 1 && buf[0] == SETTINGS_MAGIC)
+    settings_unpack(s, buf + 1, (uint8_t)(got - 1));   // shorter records: see settings.h
 }
 
 inline void save_settings(const Settings &s) {
   if (!g_flash_ok) return;
-  const uint8_t buf[FB_SETTINGS_LEN] = {
-    SETTINGS_MAGIC, s.midi_channel, s.clock_source, s.out_mode };
+  uint8_t buf[FB_SETTINGS_LEN];
+  buf[0] = SETTINGS_MAGIC;
+  settings_pack(s, buf + 1);
   g_flash.write(FB_SETTINGS, buf, FB_SETTINGS_LEN);
 }
 

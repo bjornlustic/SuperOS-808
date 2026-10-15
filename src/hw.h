@@ -43,10 +43,18 @@ inline void Init() {
   }
   // The µPD444C data bus stays hi-Z: the real RAMs are still fitted and drive it.
   for (uint8_t i = 0; i < 4; ++i) pinMode(RAM_BUS_PINS[i], INPUT);
-  // PI0 idles LOW. It is the RAM /WE line, so it is pulsed only by ModeProbe().
+  // PI0 idles LOW. It is the RAM /WE line, so it is pulsed only by WriteEnable().
   pinMode(PI0_PIN, OUTPUT);
   digitalWrite(PI0_PIN, LOW);
   PORTF = 0x0F;            // all selects inactive, all LEDs off
+  // Socket pin 18 (BD data, PF2_PIN = AVR PC6) passes U5, a TS5A3159A path
+  // selector on boards that also serve the TB-303. AVR PA4 LOW (R15 holds it
+  // there while hi-Z) routes PC6 through the 303 cutoff-CV low-pass, which
+  // smears the BD edge so the bass drum never fires. HIGH is the raw path. PA4 is
+  // otherwise unused by this firmware. Every boot path runs Init, so both
+  // firmwares get it.
+  PORTA |= _BV(4);
+  DDRA  |= _BV(4);
 }
 
 // Light exactly one step-LED matrix cell. sel/led are 0..3. Pass led >= 4 for none.
@@ -188,23 +196,25 @@ inline void ScanAndDisplay(uint16_t frame, uint8_t cell[4], uint8_t *status,
   PORTF = 0x0F;
 }
 
-// SW1b mode probe. Drive PI0 (socket pin 30) HIGH and read what arrives on the
-// PC bus: with the board mod in place (R85 jumpered, IC7 pins 10-11 jumpered)
-// the path is pin 30 -> IC7 /WE -> IC7 I/O4 -> pin 2, gated by SW1b. So the
-// returned nibble is a second, independent view of the MODE knob.
-//
-// Returns bit0 = PC0 ... bit3 = PC3. Returns 0 on an unmodded board, where PI0
-// is not even wired to the AVR.
-//
-// Safe with the RAMs fitted: /WE alone does nothing while /CE (PI1) is idle —
-// a µPD444C only writes when it is selected. The pulse is kept short anyway.
-inline uint8_t ModeProbe() {
+// SW1b, the MODE switch's memory-protect deck, read through an optional board
+// mod: R85 bridged, PC0's 15k pull-down (R89) removed, and a RAM's pin 10
+// (/WE) linked to its pin 11 (I/O, PC0). SW1b joins /WE to PI0 in the write
+// positions (COMPOSE, 1ST/2ND PART, PATTERN CLEAR) and leaves it on R91 (1M to
+// BU) in PLAY and MANUAL PLAY. So with PI0 HIGH the node reads 1 in every
+// position (driven, or pulled up), and with PI0 LOW it reads 0 only where SW1b
+// joins it: 1 = write enabled, 0 = protected. A stock board keeps R89, so PC0
+// reads 0 with PI0 HIGH: -1, no mod, nothing to tell PLAY from COMPOSE.
+// (Measured 2026-09-28: PI0 HIGH read 1 in PLAY, COMPOSE and MANUAL PLAY.)
+// Safe with the RAMs fitted: /CE (PI1) is idle, so /WE alone writes nothing.
+inline int8_t WriteEnable() {
   digitalWrite(PI0_PIN, HIGH);
-  delayMicroseconds(20);              // 3.3k/15k divider + bus capacitance
-  uint8_t v = 0;
-  for (uint8_t i = 0; i < 4; ++i) v |= (uint8_t)(digitalRead(RAM_BUS_PINS[i]) << i);
+  delayMicroseconds(20);
+  const bool hi = digitalRead(RAM_BUS_PINS[0]);
   digitalWrite(PI0_PIN, LOW);
-  return v;
+  delayMicroseconds(20);
+  const bool lo = digitalRead(RAM_BUS_PINS[0]);
+  if (!hi) return -1;
+  return lo ? 0 : 1;
 }
 
 } // namespace hw

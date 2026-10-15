@@ -401,6 +401,14 @@ input[type="file"] { display: none; }
           <option value="0">MIDI sync</option><option value="1">Internal / DIN</option></select></div>
         <div class="field"><label>MIDI out</label><select id="setOut2" disabled>
           <option value="0">Out</option><option value="1">Thru</option></select></div>
+        <div class="field"><label>SysEx in</label><select id="setSxIn" disabled>
+          <option value="1">On</option><option value="0">Off (config menu step 3 re-enables)</option></select></div>
+        <div class="field"><label>SysEx out</label><select id="setSxOut" disabled>
+          <option value="1">On</option><option value="0">Off</option></select></div>
+        <div class="field"><label>Notes in</label><select id="setNotesIn" disabled>
+          <option value="1">On</option><option value="0">Off</option></select></div>
+        <div class="field"><label>Notes out</label><select id="setNotesOut" disabled>
+          <option value="1">On</option><option value="0">Off</option></select></div>
         <button class="btn" id="btnSetGet" disabled>&#8595; Read</button>
         <button class="btn btn-primary" id="btnSetPut" disabled>&#8593; Write</button>
       </div>
@@ -734,16 +742,24 @@ function onMidi(e){
       const want = (a[1] & 0x7F) | ((a[2] & 1) << 7);
       const raw = unpack7(a.slice(3), TRACK_BYTES);
       if(raw.length !== TRACK_BYTES || xorSum(raw) !== want){ log('track dump bad','log-err'); break; }
-      tracks[trk] = { len: raw[0], pat: raw.slice(1) };
+      // bit 7 of the length byte: the track runs on into the next one (>64 measures)
+      tracks[trk] = { len: raw[0] & 0x7F, cont: raw[0] >> 7, pat: raw.slice(1) };
       if(trk === Number($('trkSel').value)) renderTrack();
       log('read track ' + (trk+1) + ' (' + tracks[trk].len + ' measures)', 'log-ack');
       pumpQueue();
       break;
     }
-    case 0x31:                                     // settings
+    case 0x31: {                                   // settings
       $('setChan').value = String(a[0]); $('setClk').value = String(a[1]); $('setOut2').value = String(a[2]);
-      log(`settings  chan=${a[0]||'omni'}  clk=${a[1]?'internal':'midi'}  out=${a[2]?'thru':'out'}`, 'log-ack');
+      // 5th value (2026-09-07): io_mask, bit0 SysEx in, bit1 SysEx out, bit2 notes in,
+      // bit3 notes out, 1 = on. A 4-value reply is the older single sysex_enable
+      // switch (both SysEx bits from it); 3 values predate any switch.
+      const m = a.length >= 5 ? a[4] : (a.length >= 4 ? (a[3] ? 15 : 12) : 15);
+      IO_IDS.forEach((id, i) => { $(id).value = String((m >> i) & 1); });
+      log(`settings  chan=${a[0]||'omni'}  clk=${a[1]?'internal':'midi'}  out=${a[2]?'thru':'out'}` +
+          `  sysex=${m&1?'in':'-'}/${m&2?'out':'-'}  notes=${m&4?'in':'-'}/${m&8?'out':'-'}`, 'log-ack');
       break;
+    }
     case 0x3C: onProbe(a); break;                  // raw panel matrix
     case 0x53: {                                   // panel table dump
       const raw = unpack7(a.slice(2), 64);
@@ -1143,10 +1159,10 @@ function calAdvance(captured){
 // moved instead of assuming one.
 function onProbe(a){
   // 0x3C payload, ONE NIBBLE PER BYTE: [0..3] PA per scan column (rotaries and
-  // buttons), [4..7] PB per scan column (step keys), [8] status, [9] the SW1b
-  // mode probe (PI0 driven high, PC bus read back — a second, independent view
-  // of the MODE knob, and what breaks the COMPOSE/PLAY tie in the SW1a diode
-  // encoder; reads a constant on an unmodded board).
+  // buttons), [4..7] PB per scan column (step keys), [8] status, [9] SW1b as
+  // hw::WriteEnable reads it: bit0 = the board mod is fitted, bit1 = the MODE
+  // switch write-protects (PLAY, MANUAL PLAY). It is what breaks the
+  // COMPOSE/PLAY tie in the SW1a diode encoder.
   if(a.length < 10){
     // Logged once per connection: the firmware streams these continuously in
     // calibration mode, and a thousand identical lines buries everything else.
@@ -1164,7 +1180,7 @@ function onProbe(a){
   $('calLive').textContent =
     `${nib(cells[0])} ${nib(cells[1])} ${nib(cells[2])} ${nib(cells[3])} | ${nib(status)}`
     + `  PB ${nib(steps[0])} ${nib(steps[1])} ${nib(steps[2])} ${nib(steps[3])}`
-    + `  SW1b ${nib(sw1b)}`;
+    + `  SW1b ${(sw1b & 1) ? ((sw1b & 2) ? 'protected' : 'write') : 'no mod'}`;
   if(calPos < 0 || calPos >= calScript.length) return;
   const st = calScript[calPos];
 
@@ -1281,7 +1297,7 @@ function saveJson(){
       rstep: Array.from(p.rstep), rval: Array.from(p.rval),
       pstep: Array.from(p.pstep), pval: Array.from(p.pval),
     })),
-    tracks: tracks.map(t => ({len: t.len, pat: Array.from(t.pat)})),
+    tracks: tracks.map(t => ({len: t.len, cont: t.cont|0, pat: Array.from(t.pat)})),
   };
   const blob = new Blob([JSON.stringify(doc)], {type:'application/json'});
   const a = document.createElement('a');
@@ -1303,7 +1319,7 @@ function loadJson(txt){
     p.pstep = Uint8Array.from(s.pstep); p.pval = Uint8Array.from(s.pval);
     patterns[i] = p;
   });
-  (doc.tracks||[]).forEach((t,i) => { if(i<NTRK) tracks[i] = {len:t.len, pat:Uint8Array.from(t.pat)}; });
+  (doc.tracks||[]).forEach((t,i) => { if(i<NTRK) tracks[i] = {len:t.len, cont:t.cont|0, pat:Uint8Array.from(t.pat)}; });
   render(); renderTrack();
   log('loaded JSON', 'log-note');
 }
@@ -1363,7 +1379,7 @@ $('btnSendAll').onclick = async () => {
   }
   for(let t=0;t<NTRK;t++){
     const raw = new Uint8Array(TRACK_BYTES);
-    raw[0] = tracks[t].len; raw.set(tracks[t].pat.slice(0,TRKMAX), 1);
+    raw[0] = tracks[t].len | ((tracks[t].cont|0) << 7); raw.set(tracks[t].pat.slice(0,TRKMAX), 1);
     const x = xorSum(raw);
     sendCmd(0x26, [t, x & 0x7F, (x>>7)&1, ...pack7(raw)]);
     await new Promise(r => setTimeout(r, 40));
@@ -1389,10 +1405,21 @@ $('btnCalSkip').onclick  = () => calAdvance(null);
 $('btnCalWrite').onclick = calWrite;
 $('btnCalRead').onclick  = () => sendCmd(0x33);
 
+const IO_IDS = ['setSxIn', 'setSxOut', 'setNotesIn', 'setNotesOut'];   // io_mask bit order
 $('btnSetGet').onclick = () => sendCmd(0x30);
-$('btnSetPut').onclick = () => sendCmd(0x32, [Number($('setChan').value),
-                                              Number($('setClk').value),
-                                              Number($('setOut2').value)]);
+$('btnSetPut').onclick = () => {
+  let m = 0;
+  IO_IDS.forEach((id, i) => { if (Number($(id).value)) m |= 1 << i; });
+  // SysEx IN off is a one-way trip over the wire: the firmware drops every SysEx
+  // after it, this editor's included, until config menu step 3 (CLEAR held + TAP,
+  // then step 3) turns it back on.
+  if (!(m & 1) && !confirm('Switch SysEx IN off? The 808 will ignore this editor entirely ' +
+      'until you re-enable it from the panel: hold CLEAR, press TAP, then press step 3.')) return;
+  // 4th value is the pre-2026-09-07 sysex_enable, kept as a projection (1 only when
+  // SysEx is on in both directions) so a 4-value firmware still decodes the write.
+  sendCmd(0x32, [Number($('setChan').value), Number($('setClk').value), Number($('setOut2').value),
+                 (m & 3) === 3 ? 1 : 0, m]);
+};
 
 $('btnSaveJson').onclick = saveJson;
 $('btnLoadJson').onclick = () => $('fileJson').click();

@@ -220,6 +220,35 @@ static void lamp_service(uint32_t now) {
   }
 }
 
+#ifdef SUPEROS_EMU_TESTHOOKS
+// ---------------------------------------------------------------------------
+// Test hooks: the emulator's side of the G12 drive/observe channel, so the
+// stock program on THIS machine can be driven and read the same way SuperOS
+// is (tools/diag/rtrack_hw_compare.py). Never in a shipping build. Its own
+// flag, not SUPEROS_TESTHOOKS: on the internal-flash envs it does not fit.
+//
+//   0x4B <en> <mask x9> <val x9>   panel overlay, the SuperOS message byte for
+//                                  byte: [0..3] PA nibble per select, [4..7] PB
+//                                  nibble, [8] status. Applied to the raw
+//                                  samples BEFORE the debouncers, as there.
+//   0x3E 00                        -> 0x3F 00 <ram 0x00-0x4F, 0x70-0x7F: 96
+//                                  nibbles> <n> <n x 4 nibbles: row, bank,
+//                                  track row, auto-fill count lo, per measure>
+//                                  and the measure log is emptied
+//   0x3E 01 <chunk>                -> 0x3F 01 <chunk> <128 nibbles>: 64 bytes of
+//                                  the emulated pattern/track store
+//   0x3E 02 <chunk> <128 nibbles>  write them back (-> 0x3F 02 <chunk>)
+static uint8_t s_tinj_on = 0;
+static uint8_t s_tinj_m[9], s_tinj_v[9];
+static uint8_t s_ml[16][4];               // measure log: one row per measure start
+static uint8_t s_ml_n = 0;
+static uint8_t s_last_pi = 0;
+static inline uint8_t emu_ram(uint8_t i) { return (uint8_t)(D650_CPU(&H)->ram[i] & 0x0F); }
+static inline uint8_t tinj(uint8_t k, uint8_t raw) {
+  return s_tinj_on ? (uint8_t)((raw & (uint8_t)~s_tinj_m[k]) | (s_tinj_v[k] & s_tinj_m[k])) : raw;
+}
+#endif
+
 static void hook_port(void *, int port, uint8_t v) {
   switch (port) {
     case UCOM4_PORTD: write_nib(s_fp_pd, v); break;
@@ -251,6 +280,14 @@ static void hook_port(void *, int port, uint8_t v) {
         if (!s_trig_on) { s_trig_on = true; write_pe(); }
       }
       fast_wr(&s_fp_pi2, trig);
+#ifdef SUPEROS_EMU_TESTHOOKS
+      // A COMMON TRIG on step 0 is a measure start: log what it plays.
+      if (trig && !((s_last_pi >> 2) & 1) && emu_ram(0x0D) == 0 && s_ml_n < 16) {
+        uint8_t *r = s_ml[s_ml_n++];
+        r[0] = emu_ram(0x17); r[1] = emu_ram(0x0E); r[2] = emu_ram(0x70); r[3] = emu_ram(0x19);
+      }
+      s_last_pi = v;
+#endif
       break;
     }
     default: break;
@@ -879,8 +916,13 @@ static void poll_matrix(uint32_t now_us) {
   ++s_pm_n;
 
   const uint8_t pins = PINB;
+#ifdef SUPEROS_EMU_TESTHOOKS
+  const uint8_t pa   = tinj(row, (uint8_t)(pins & 0x0F));
+  const uint8_t pb   = tinj((uint8_t)(4 + row), (uint8_t)((pins >> 4) & 0x0F));
+#else
   const uint8_t pa   = (uint8_t)(pins & 0x0F);         // PA0-3
   const uint8_t pb   = (uint8_t)((pins >> 4) & 0x0F);  // the 16 step switches
+#endif
 #ifdef D650_PROBE_AUX
   s_raw_pa[row] = pa; s_raw_pb[row] = pb;    // ground truth for panel debugging
   // Sticky: every line that has EVER read high since boot. An ISP read resets
@@ -902,6 +944,9 @@ static void poll_matrix(uint32_t now_us) {
 // The STATUS group, sampled from clock_sample()'s parked window (see there).
 // The clock slot itself is skipped: it is served live by emu_read_clock.
 static void status_sample(uint8_t pa) {
+#ifdef SUPEROS_EMU_TESTHOOKS
+  pa = tinj(8, pa);
+#endif
   for (uint8_t j = 0; j < 3; ++j)
     db_status((uint8_t)(D650_IN_STATUS + j),
               (uint8_t)((pa >> s_status_src[j]) & 1));
@@ -1090,9 +1135,72 @@ static void menu_gesture(void) {
 // switch that gets you back to SuperOS, and a program-image upload. Everything
 // else is ignored; the emulated machine has no MIDI of its own.
 static uint8_t s_sx_state = 0;   // 0 idle, 1 saw F0, 2 saw 7D, 3 in 0x4D
+#ifdef SUPEROS_EMU_TESTHOOKS
+// 5 = in 0x4B, 6 = in 0x3E. Arguments are consumed as they arrive (no buffer:
+// a combined build cannot spare the RAM), s_tx_i counting the argument byte.
+static uint8_t s_tx_i = 0, s_tx_op = 0, s_tx_chunk = 0;
+static uint8_t s_tx_buf[4 + 96 + 1 + 16 * 4 + 1];
+static void tx_send(uint8_t n) {
+#ifdef SUPEROS_USB_MIDI
+  usbMIDI.sendSysEx(n, s_tx_buf, true);
+  usbMIDI.send_now();
+#endif
+  // USB only. A DIN copy of a 170-byte reply blocks for 54 ms at 31250 baud,
+  // which starved the emulated CPU 14x under polling (measured: 1.8 s a step).
+}
+static void tx_reply() {
+  uint8_t *b = s_tx_buf, n = 0;
+  b[n++] = 0xF0; b[n++] = 0x7D; b[n++] = 0x3F; b[n++] = s_tx_op;
+  if (s_tx_op == 0) {
+    for (uint8_t i = 0; i < 0x50; ++i) b[n++] = emu_ram(i);
+    for (uint8_t i = 0x70; i < 0x80; ++i) b[n++] = emu_ram(i);
+    b[n++] = s_ml_n;
+    for (uint8_t m = 0; m < s_ml_n; ++m)
+      for (uint8_t k = 0; k < 4; ++k) b[n++] = s_ml[m][k];
+    s_ml_n = 0;
+  } else {
+    b[n++] = s_tx_chunk;
+    if (s_tx_op == 1)
+      for (uint8_t i = 0; i < 64; ++i) {
+        const uint8_t x = H.ext[(uint16_t)s_tx_chunk * 64 + i];
+        b[n++] = (uint8_t)(x & 0x0F); b[n++] = (uint8_t)(x >> 4);
+      }
+  }
+  b[n++] = 0xF7;
+  tx_send(n);
+}
+static void tx_arg(uint8_t b) {
+  const uint8_t i = s_tx_i++;
+  if (s_sx_state == 5) {                       // 0x4B
+    if (i == 0) s_tinj_on = b;
+    else if (i <= 9) s_tinj_m[i - 1] = (uint8_t)(b & 0x0F);
+    else if (i <= 18) s_tinj_v[i - 10] = (uint8_t)(b & 0x0F);
+    return;
+  }
+  if (i == 0) { s_tx_op = b; return; }         // 0x3E
+  if (i == 1) { s_tx_chunk = (uint8_t)(b & 31); return; }
+  if (s_tx_op == 2 && i < 130) {
+    uint8_t &x = H.ext[(uint16_t)s_tx_chunk * 64 + ((i - 2) >> 1)];
+    x = (i & 1) ? (uint8_t)((x & 0x0F) | (b << 4)) : (uint8_t)((x & 0xF0) | (b & 0x0F));
+    H.ext_dirty = 1;
+  }
+}
+#endif
+
+// Clock from one port at a time (as midi.cpp): a master on USB and DIN at once
+// sends every 0xF8 twice. The port of the last real-time byte owns clock and
+// transport until it has been silent 500 ms.
+static uint8_t  s_clk_src    = 0;      // 0 DIN, 1 USB
+static uint32_t s_clk_src_ms = 0;
 
 // One MIDI real-time byte, from either port.
-static void midi_realtime(uint8_t b) {
+static void midi_realtime(uint8_t b, uint8_t src) {
+  if (b == 0xF8 || b == 0xFA || b == 0xFB || b == 0xFC) {
+    const uint32_t now = millis();
+    if (src != s_clk_src && (uint32_t)(now - s_clk_src_ms) < 500) return;
+    s_clk_src = src;
+    s_clk_src_ms = now;
+  }
   switch (b) {
     case 0xF8:
       if (!midi_clock_enabled()) break;         // INTERNAL: DIN/knob only
@@ -1109,8 +1217,9 @@ static void midi_realtime(uint8_t b) {
 // USB can reach the same parser: see usb_sysex_chunk below.
 static void midi_byte(uint8_t b) {
   // The image receiver needs the whole stream, including F0/F7. On boards with
-  // no room to store one it is a stub that never fires.
-  if (s_imgrx.Byte(b)) {
+  // no room to store one it is a stub that never fires. Gated with the rest of
+  // SysEx by the SysEx IN switch below.
+  if (g_settings.sysex_in() && s_imgrx.Byte(b)) {
 #ifdef D650_IMG_UPLOADABLE
     img_save(s_img);
 #endif
@@ -1122,7 +1231,13 @@ static void midi_byte(uint8_t b) {
   }
 
   switch (s_sx_state) {
-    case 0: if (b == 0xF0) s_sx_state = 1; break;
+    // SysEx IN switch (config menu step 3, shared g_settings): with it off,
+    // an incoming SysEx goes straight to the skip state, so 0x4D
+    // firmware-switch and 0x4A boot are dropped on this side too. Framing
+    // stays tracked so the byte stream cannot desync. The other three
+    // switches are inert here: the emulated machine sends no SysEx and has
+    // no notion of a MIDI note in either direction.
+    case 0: if (b == 0xF0) s_sx_state = g_settings.sysex_in() ? 1 : 4; break;
     case 1: s_sx_state = (b == 0x7D) ? 2 : 0; break;
     case 2:
       if (b == 0x4D) s_sx_state = 3;
@@ -1145,8 +1260,19 @@ static void midi_byte(uint8_t b) {
         asm volatile("jmp 0x1F000");   // boot section (BOOTRST, BOOTSZ=01)
       }
       else if (b == 0xF7) s_sx_state = 0;
+#ifdef SUPEROS_EMU_TESTHOOKS
+      else if (b == 0x4B || b == 0x3E) { s_sx_state = (b == 0x4B) ? 5 : 6; s_tx_i = 0; }
+#endif
       else s_sx_state = 4;                      // some other command: skip
       break;
+#ifdef SUPEROS_EMU_TESTHOOKS
+    case 5:
+    case 6:
+      if (b != 0xF7) { tx_arg(b); break; }
+      if (s_sx_state == 6) tx_reply();
+      s_sx_state = 0;
+      break;
+#endif
     case 3:
       if (b <= 1) {
         patt_flush();
@@ -1182,7 +1308,7 @@ static void usb_sysex_chunk(const uint8_t *d, uint16_t n, bool complete) {
     for (uint16_t i = 0; i < n; ++i) {
       const uint8_t b = d[i];
       // Real-time can be embedded mid-SysEx; it must not reach the parser.
-      if (b >= 0xF8) { midi_realtime(b); continue; }
+      if (b >= 0xF8) { midi_realtime(b, 1); continue; }
       midi_byte(b);
     }
     if (complete && d[n - 1] != 0xF7) midi_byte(0xF7);
@@ -1214,7 +1340,7 @@ static void midi_poll() {
     // in at one packet per pass and never complete.
     if (!usbMIDI.read()) continue;
     const uint8_t ut = usbMIDI.getType();
-    if (ut >= 0xF8) midi_realtime(ut);
+    if (ut >= 0xF8) midi_realtime(ut, 1);
   }
 #endif
   while (Serial1.available() > 0) {
@@ -1224,7 +1350,7 @@ static void midi_poll() {
     // handled first and never reaches the parsers below — ImgRx aborts on any
     // status byte, and a clock tick arriving during an image upload would
     // otherwise kill the transfer.
-    if (b >= 0xF8) { midi_realtime(b); continue; }
+    if (b >= 0xF8) { midi_realtime(b, 0); continue; }
 
     midi_byte(b);
   }

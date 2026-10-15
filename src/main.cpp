@@ -35,6 +35,7 @@
 #include "pattern.h"
 #include "engine.h"
 #include "settings.h"
+#include "uclock.h"
 #include "flash_persist.h"
 #include "boot_update.h"
 #include "midi_api.h"
@@ -75,8 +76,12 @@ PanelMap g_panel_map;
 // two. Realtime bytes write directly: the MIDI spec lets them interleave
 // anywhere, and clock must not wait behind a queued dump.
 static inline bool midi_out_live() { return g_settings.out_mode == OUT_MODE_OUT; }
+// Note On also honours the NOTES OUT switch (settings.h io_mask). Note Off is
+// gated by OUT/THRU only: the clock tick records prev_fired only for hits it
+// actually sent, so a switch-off mid-tick still gets its note-offs out and a
+// switched-off run sends nothing at all.
 static inline void midiNoteOn(uint8_t n, uint8_t v) {
-  if (!midi_out_live()) return;
+  if (!midi_out_live() || !g_settings.notes_out()) return;
   const uint8_t m[3] = { 0x90, (uint8_t)(n & 0x7F), (uint8_t)(v & 0x7F) };
   midi_tx_msg(m, 3);
 }
@@ -802,25 +807,51 @@ static void handle_manual_play() {
   if (tapB.rising()) eng.TapFill();
 }
 
-// PLAY: rhythm-track playback. INSTRUMENT/TRACK picks track 1-12.
-static void handle_track_play(uint8_t inst) {
-  if (!eng.running) eng.cur_track = inst % NUM_TRACKS;
-  if (tapB.rising()) eng.TapFill();
-}
+// PLAY and COMPOSE: the rhythm tracks. INSTRUMENT/TRACK picks track 1-12.
+//
+// ONE HANDLER FOR BOTH DETENTS, because the diode encoder gives the CPU one
+// code for both: measured off the 1981 program (tools/d650/rtrack_probe), PLAY
+// and COMPOSE are MODE code 3 and the program runs the same code for each. What
+// separates them on a stock 808 is SW1b, the MODE switch's second deck, which
+// cuts the RAM write line in PLAY.
+//
+// WITH THE SW1b MOD (hw::WriteEnable >= 0) loop() decodes the two detents, so
+// this is the stock machine:
+//   PLAY      START plays the track from measure 1 and loops; keys change the
+//             next measure for one pass; nothing is written, CLEAR arms nothing
+//   COMPOSE   START alone is EDIT: the track replays and the keys overwrite the
+//             measures they change, length fixed (OM p.20)
+//             CLEAR, START is RECORD: a new track from measure 1, every pattern
+//             change, TAP fill, intro and auto fill memorized, and the measure
+//             STOP lands in is the last one (OM p.19)
+//
+// WITHOUT IT both detents read as PLAY and the player makes the write decision
+// with CLEAR, in either detent: START plays, CLEAR then START records, CLEAR x2
+// (quick) then START edits. The same gesture again disarms.
+//
+// Armed RECORD shows STEP 16 steady, the stock program's own indication; EDIT
+// shows it blinking.
+static uint8_t s_trk_arm = 0;   // 0 play, 1 record, 2 edit
+// SW1b through the board mod (hw::WriteEnable): -1 no mod, 0 protected, 1
+// write-enabled. Sampled in loop() while the dial is on code 3.
+static int8_t s_sw1b = -1;
 
-// COMPOSE: record a rhythm track in real time. The operator clears the track
-// with CLEAR, presses START, switches patterns with the STEP buttons as it runs,
-// and presses STOP on the measure that should be last (OM p.19).
-static void handle_compose(uint8_t inst) {
+static void handle_track(uint8_t inst) {
+  const uint8_t t = (uint8_t)(inst % NUM_TRACKS);
   if (!eng.running) {
-    eng.cur_track = inst % NUM_TRACKS;
-    if (clr.tap) { eng.TrackClear(); clr.tap = false; }
+    eng.cur_track = t;
+    if (s_trk_arm != 1) eng.sel_slot = eng.track[t].pat(0);
+    // PLAY is memory-protected, as stock: with SW1b readable only COMPOSE
+    // arms a write. Without the mod the CLEAR gestures are the only way to
+    // RECORD or EDIT, so they arm in either detent.
+    const bool may_write = !(modeVal == MODE_PLAY && s_sw1b >= 0);
+    if (clr.tap)  { if (may_write) s_trk_arm = s_trk_arm == 1 ? 0 : 1; clr.tap = false; }
+    if (clr.dtap) { if (may_write) s_trk_arm = s_trk_arm == 2 ? 0 : 2; clr.dtap = false; }
+  } else {
+    eng.loop_track = t;           // taken at the loop point, as stock does
   }
-  for (uint8_t s = 0; s < NUM_STEP_BTNS; ++s) {
-    if (!stepB[s].rising()) continue;
-    if (slot_is_fill(s)) eng.SelectFillSlot(s);
-    else                 eng.SelectSlot(s);
-  }
+  for (uint8_t s = 0; s < NUM_STEP_BTNS; ++s)
+    if (stepB[s].rising()) eng.SelectSlot(s);
   if (tapB.rising()) eng.TapFill();
 }
 
@@ -915,7 +946,9 @@ static void handle_pattern_clear_mode() {
 // the pattern again). Cleared on tool change.
 static bool s_ilen_phase = false;
 
-static void handle_tool(uint8_t tool, uint8_t inst) {
+// noinline: its one call site pulled it into superos_loop once handle_track
+// shrank, which cost 32 B of flash and put its frame on the loop root.
+static __attribute__((noinline)) void handle_tool(uint8_t tool, uint8_t inst) {
   const uint8_t sec = disp_section;
 
   switch (tool) {
@@ -946,7 +979,11 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
       } else {
         for (uint8_t b = 0; b < NUM_STEP_BTNS; ++b)
           if (stepB[b].rising()) {
-            eng.SetSectionLength(sec, (uint8_t)(b + 1));
+            // Pressing the length a part already has DELETES it (length 0),
+            // the same "press what it already is" gesture as VOICE mode. The
+            // 1st PART cannot be deleted: a pattern always has one part.
+            const uint8_t L = (uint8_t)(b + 1);
+            eng.SetSectionLength(sec, (sec > 0 && eng.SectionLength(sec) == L) ? 0 : L);
             midi_send_layout_update(eng.cur_pat);
           }
       }
@@ -1171,6 +1208,16 @@ static void handle_tool(uint8_t tool, uint8_t inst) {
 // few ms, so the flush also waits for the sequencer to be stopped.
 static bool s_settings_dirty = false;
 
+// Config menu steps 3, 4, 13, 14: the four MIDI I/O switches, in io_mask bit
+// order (settings.h). Lit = OFF, like every other non-default in this menu.
+// Unrolled at both sites on purpose: a loop over the four costs a variable
+// shift (a loop on AVR) per key and per lamp, and measured 120 B heavier.
+static void __attribute__((noinline)) io_toggle(uint8_t bit) {
+  g_settings.io_mask ^= bit;
+  s_settings_dirty = true;
+  midi_send_settings();
+}
+
 static void handle_config_menu() {
   if (stepB[0].rising()) { g_settings.midi_channel = 0; s_settings_dirty = true; midi_send_settings(); }
   if (stepB[1].rising()) {
@@ -1178,6 +1225,14 @@ static void handle_config_menu() {
     s_settings_dirty = true;
     midi_send_settings();
   }
+  // Steps 3, 4, 13, 14: SysEx IN, SysEx OUT, NOTES IN, NOTES OUT. Lit = OFF
+  // (see build_menu_frame). Step 3 is the only way back on for SysEx IN: a
+  // switched-off IN drops every incoming SysEx, including the 0x32 that could
+  // re-enable it (settings.h).
+  if (stepB[2].rising())  io_toggle(IO_SYSEX_IN);
+  if (stepB[3].rising())  io_toggle(IO_SYSEX_OUT);
+  if (stepB[12].rising()) io_toggle(IO_NOTES_IN);
+  if (stepB[13].rising()) io_toggle(IO_NOTES_OUT);
   if (stepB[4].rising()) {
     g_settings.clock_source = (uint8_t)(g_settings.clock_source == CLK_SRC_MIDI ? CLK_SRC_INTERNAL : CLK_SRC_MIDI);
     s_settings_dirty = true;
@@ -1223,7 +1278,7 @@ static void handle_config_menu() {
 static uint16_t build_frame(uint8_t mode, uint8_t inst) {
   uint16_t f = 0;
 
-  if (mode == MODE_MANUAL_PLAY || mode == MODE_PLAY) {
+  if (mode == MODE_MANUAL_PLAY) {
     // Stock priority display (OM p.11): the rhythm that will play first FLASHES,
     // the other selected one stays lit. Arming an INTRO with TAP moves the flash
     // from the basic rhythm to the INTRO/FILL IN button.
@@ -1234,9 +1289,19 @@ static uint16_t build_frame(uint8_t mode, uint8_t inst) {
     return eng.play_row(eng.running ? eng.BeatBlink() : tempo_blink());
   }
 
-  if (mode == MODE_COMPOSE) {
-    f = led_bit(eng.sel_slot);
-    if (!eng.running && !tempo_blink()) f = 0;      // flashing = ready to compose
+  if (mode == MODE_PLAY || mode == MODE_COMPOSE) {
+    // Stock, measured: stopped, the pattern of measure 1 flashes (handle_track
+    // keeps sel_slot on it until RECORD is armed; then the selected one, with
+    // STEP 16 steady); running, the measure's pattern is lit steady with the
+    // one-tick chase over it.
+    const bool blink = tempo_blink();
+    f = led_bit(eng.FillPlaying() ? eng.fill_slot : eng.sel_slot);
+    if (eng.running) {
+      if (eng.chase_lit()) f ^= led_bit((uint8_t)(eng.position() & 15));
+    } else {
+      if (!blink) f = 0;
+      if (s_trk_arm == 1 || (s_trk_arm == 2 && blink)) f |= led_bit(15);
+    }
     return f;
   }
 
@@ -1414,6 +1479,11 @@ static uint16_t build_tool_frame(uint8_t tool, uint8_t inst) {
 static uint16_t build_menu_frame() {
   uint16_t f = 0;
   f |= led_bit(g_settings.midi_channel == 0 ? 0 : 1);
+  const uint8_t io_off = (uint8_t)(~g_settings.io_mask & IO_ALL);    // steps 3/4/13/14 lit = OFF
+  if (io_off & IO_SYSEX_IN)                        f |= led_bit(2);
+  if (io_off & IO_SYSEX_OUT)                       f |= led_bit(3);
+  if (io_off & IO_NOTES_IN)                        f |= led_bit(12);
+  if (io_off & IO_NOTES_OUT)                       f |= led_bit(13);
   if (g_settings.clock_source == CLK_SRC_INTERNAL) f |= led_bit(4);
   if (g_settings.out_mode == OUT_MODE_THRU)        f |= led_bit(5);
   if (midi_calibration_active())                   f |= led_bit(7);
@@ -1607,6 +1677,17 @@ void loop() {
   }
 #endif
 
+  // PLAY and COMPOSE share MODE code 3; SW1b tells them apart where the board
+  // mod reads it back (hw::WriteEnable). Sampled every 8 ms, not every pass: it
+  // costs 40 us, and the dial does not move faster than that.
+  {
+    static uint32_t s_sw1b_ms = 0;
+    if (modeVal == MODE_PLAY || modeVal == MODE_COMPOSE) {
+      if ((uint32_t)(now_ms - s_sw1b_ms) >= 8) { s_sw1b_ms = now_ms; s_sw1b = hw::WriteEnable(); }
+      if (s_sw1b >= 0) modeVal = s_sw1b ? MODE_COMPOSE : MODE_PLAY;
+    }
+  }
+
   const uint8_t mode = modeVal;
   const uint8_t inst = instVal % NUM_INSTRUMENTS;
 
@@ -1716,7 +1797,15 @@ void loop() {
 
   bool replay_tick = false;
   if ((want_run && !s_want_run) || (mc.started && want_run)) {
-    eng.Start(mode == MODE_PLAY, mode == MODE_COMPOSE);
+    if (mode == MODE_PLAY || mode == MODE_COMPOSE) {
+      // MODE_COMPOSE decodes where SW1b is readable (the board mod) or a
+      // calibrated map gives it its own code.
+      const uint8_t arm = (mode == MODE_COMPOSE && s_trk_arm == 0) ? 2 : s_trk_arm;
+      eng.Start(arm != 1, arm != 0);
+      s_trk_arm = 0;             // armed for one START, as the stock CLEAR is
+    } else {
+      eng.Start(false, false);
+    }
     { const uint8_t sreg = SREG; cli(); s_clk_running = true;
       // G10 phase alignment: a Start from the host IS the downbeat, so the
       // indicator phase is zeroed with the sequencer's rather than carrying
@@ -1763,11 +1852,26 @@ void loop() {
     }
     SREG = sreg;
     s_clk_ext_prev = ext_sync;
+    // Only when the MIDI clock goes away: stale owed MIDI ticks must not fire
+    // against the internal clock. NOT when it arrives: a master that sends no
+    // clock while stopped (the MPC Live) sends Start and its first clock 1 ms
+    // apart, and when both land in one drain the handover is decided here,
+    // after OnClockByte counted that clock. Resetting then threw the downbeat
+    // away and the 808 played one clock (19 ms at 129 BPM) late, on 8 starts
+    // of 12 (2026-09-28). A fresh stream needs nothing here: OnClockByte seeds
+    // from the wire after a gap, and Start already reset the smoother.
+    if (!ext_sync) uclk::Reset();
   }
 
   uint8_t ticks = 0;
   if (ext_sync) {
-    ticks = mc.pulses;
+    // Smoothed external clock (uclock.h): the engine steps at the uClock
+    // timebase's predicted tick times, not at raw byte arrival, so USB
+    // delivery jitter and burst batching stay out of the audio. Tick COUNT
+    // integrity is uclk's invariant (every 0xF8 fires exactly one tick), so
+    // the sequencer can never drift against the host. mc.pulses still feeds
+    // the liveness window above; the engine ticks come from here.
+    ticks = uclk::Poll(micros());
   } else if (clkB.rising_now()) {
     { const uint8_t sreg = SREG; cli(); clk_track_edge(micros()); SREG = sreg; }
     midiRT(0xF8);
@@ -1820,7 +1924,7 @@ void loop() {
       for (uint8_t i = INST_BD; i < NUM_INSTRUMENTS; ++i)
         if (eng.fired() & led_bit(i))
           midiNoteOn(INSTRUMENT_NOTE[i], eng.fired_accent() ? 127 : 96);
-      prev_fired = eng.fired();
+      prev_fired = g_settings.notes_out() ? eng.fired() : 0;
       midi_send_step_position(eng.cur_pat, eng.position());
     }
   }
@@ -1958,6 +2062,7 @@ void loop() {
     s_tool = TOOL_NONE;          // turning the dial lands you in a base mode
     if (!eng.running) save_dirty(eng);
     s_occ_var = 0xFF;            // entering PATTERN CLEAR shows fresh data
+    s_trk_arm = 0;
     prev_mode = mode;
   }
   if (tools_ok && clr.map_open() && clearB.held()) {
@@ -1969,8 +2074,8 @@ void loop() {
       case MODE_1ST_PART:
       case MODE_2ND_PART:      handle_pattern_write(inst);  break;
       case MODE_MANUAL_PLAY:   handle_manual_play();        break;
-      case MODE_PLAY:          handle_track_play(inst);     break;
-      case MODE_COMPOSE:       handle_compose(inst);        break;
+      case MODE_PLAY:
+      case MODE_COMPOSE:       handle_track(inst);          break;
       case MODE_PATTERN_CLEAR: handle_pattern_clear_mode(); break;
       default: break;
     }

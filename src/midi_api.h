@@ -5,7 +5,8 @@
 // uses. Command spaces don't collide: the bootloader owns 0x01/0x02 (and only
 // runs at boot), the app owns 0x10+.
 //
-// Patterns (228 bytes, see pattern.h), tracks (65 bytes) and the panel map
+// Patterns (228 bytes, see pattern.h), tracks (65 bytes: a length byte whose
+// bit 7 means "runs on into the next track", then 64 slots) and the panel map
 // travel 7-bit packed (bootloader scheme: 7 data bytes -> 1 MSB byte + 7 low-7
 // bytes) with an XOR checksum of the raw bytes sent as two 7-bit values.
 //
@@ -151,6 +152,15 @@ void midi_usb_init();
 
 /// Queue a settings dump (0x31), sent on a 0x30 request and echoed after a
 /// 0x32 set so the editor always sees the applied (sanitized) values.
+/// Body is the settings.h codec, 5 values since 2026-09-07: channel,
+/// clock_source, out_mode, legacy sysex_enable (a projection: 1 only when
+/// SysEx is live in BOTH directions), io_mask (bit0 SysEx in, bit1 SysEx out,
+/// bit2 notes in, bit3 notes out; 1 = enabled). Each field was APPENDED so
+/// older 3- and 4-value decoders are unaffected. 0x32 mirrors it and accepts
+/// 3, 4 or 5 values; a 4-value write sets both SysEx bits from the legacy
+/// byte. Over the wire SysEx IN can only ever be switched OFF (a switched-off
+/// IN drops all incoming SysEx, 0x32 included; re-enable is config menu step
+/// 3 or a settings wipe).
 void midi_send_settings();
 
 /// True exactly once when a settings change pushed over SysEx is ready to

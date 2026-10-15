@@ -441,7 +441,13 @@ inline void deserialize_pattern(Pattern &p, const uint8_t *buf) {
 struct Track {
   static constexpr uint8_t PACKED_BYTES = (TRACK_MAX_PATS + 1) / 2;
 
-  uint8_t len;                   // measures recorded (0 = empty track)
+  // `cont` is the stock program's "continues" bit (bit 3 of its length high
+  // nibble): COMPOSE ran past 64 measures and rolled into the next track, so
+  // playback runs on into it (OM p.19, measured in tools/d650/rtrack_probe).
+  // It rides bit 7 of the serialized length byte, which a record written
+  // before it existed never sets.
+  uint8_t len  : 7;              // measures recorded (0 = empty track)
+  uint8_t cont : 1;
   uint8_t pat_[PACKED_BYTES];    // two measures per byte, low nibble first
 
   uint8_t pat(uint8_t i) const {
@@ -449,21 +455,22 @@ struct Track {
     const uint8_t b = pat_[i >> 1];
     return (uint8_t)((i & 1) ? (b >> 4) : (b & 0x0F));
   }
-  void set_pat(uint8_t i, uint8_t v) {
+  // Out of line: inlined at every track write it cost 194 B of flash.
+  __attribute__((noinline)) void set_pat(uint8_t i, uint8_t v) {
     if (i >= TRACK_MAX_PATS) return;
     uint8_t &b = pat_[i >> 1];
     if (i & 1) b = (uint8_t)((b & 0x0F) | (uint8_t)((v & 0x0F) << 4));
     else       b = (uint8_t)((b & 0xF0) |  (uint8_t)(v & 0x0F));
   }
 
-  void Clear() { len = 0; memset(pat_, 0, sizeof(pat_)); }
+  void Clear() { len = 0; cont = 0; memset(pat_, 0, sizeof(pat_)); }
 };
 
 static constexpr uint8_t TRACK_BYTES = 1 + TRACK_MAX_PATS;  // 65
 
 // One byte per measure on the wire and in flash, whatever the RAM layout is.
 inline void serialize_track(const Track &t, uint8_t *buf) {
-  buf[0] = t.len;
+  buf[0] = (uint8_t)(t.len | (t.cont << 7));
   for (uint8_t i = 0; i < TRACK_MAX_PATS; ++i) buf[1 + i] = t.pat(i);
 }
 
@@ -471,6 +478,8 @@ inline void serialize_track(const Track &t, uint8_t *buf) {
 // than as an out-of-range slot. The old explicit range check is therefore not
 // missing here, it is in the type.
 inline void deserialize_track(Track &t, const uint8_t *buf) {
-  t.len = buf[0] > TRACK_MAX_PATS ? TRACK_MAX_PATS : buf[0];
+  const uint8_t n = buf[0] & 0x7F;
+  t.len  = n > TRACK_MAX_PATS ? TRACK_MAX_PATS : n;
+  t.cont = buf[0] >> 7;
   for (uint8_t i = 0; i < TRACK_MAX_PATS; ++i) t.set_pat(i, buf[1 + i]);
 }

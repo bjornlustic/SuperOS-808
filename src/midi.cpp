@@ -8,6 +8,7 @@
 #include "pattern.h"
 #include "engine.h"
 #include "settings.h"
+#include "uclock.h"
 #include "controls.h"
 #include "hw.h"
 #include "usb_sof.h"
@@ -132,6 +133,12 @@ static uint16_t txq_free() {
 }
 
 bool midi_tx_msg(const uint8_t *msg, uint16_t len) {
+  // SysEx OUT switch (Settings.io_mask, config menu step 4): with it off, no
+  // SysEx leaves the machine on either port. Return true, not false: a false
+  // would make the deferred-dump senders re-queue the same dump forever.
+  // Notes are gated upstream (main.cpp midiNoteOn) and realtime never comes
+  // through here, so both pass untouched.
+  if (len >= 2 && msg[0] == 0xF0 && !g_settings.sysex_out()) return true;
 #ifdef SUPEROS_USB_MIDI
   // Mirror every whole message to the USB-MIDI port first, and never gated on
   // DIN ring space: the web editor over USB must see replies even when the
@@ -298,7 +305,8 @@ static bool    s_last_running  = false;
 //   [0..3] PA0-3 read while scan column 0..3 is selected  (rotaries + buttons)
 //   [4..7] PB0-3 read while scan column 0..3 is selected  (step switches)
 //   [8]    status nibble, all selects idle (tempo clock / start-stop / tap / fill)
-//   [9]    hw::ModeProbe() — SW1b seen through the PC bus, 0 on an unmodded board
+//   [9]    SW1b (hw::WriteEnable): bit0 = mod fitted, bit1 = protected (PLAY,
+//          MANUAL PLAY); 0 on an unmodded board
 //
 // The nibble-per-byte layout is not cosmetic. SysEx data bytes are 7-bit, and
 // send_short masks every body byte with 0x7F. The earlier layout sent a whole
@@ -426,6 +434,12 @@ static bool channel_ok(uint8_t status) {
 }
 
 static void handle_sysex(Engine &eng, uint8_t *body, uint16_t blen) {
+  // SysEx IN switch: with it off, every incoming SysEx is parsed for framing
+  // (so the byte stream stays in sync) and then dropped here -- including
+  // 0x32 set-settings and 0x4A boot, so the ONLY ways to re-enable are the
+  // config menu (step 3) or a settings wipe. Deliberate: "off" that can be
+  // talked back on over the wire is not off.
+  if (!g_settings.sysex_in()) return;
   if (blen < 2 || body[0] != MFR_ID) return;
   const uint8_t cmd = body[1];
   const uint8_t *a  = body + 2;               // arguments
@@ -575,11 +589,12 @@ static void handle_sysex(Engine &eng, uint8_t *body, uint16_t blen) {
     case 0x33: s_panelmap_dump = true; break;   // request the panel decode table
 
     case 0x32:                                 // set settings
-      if (an >= 3) {
-        g_settings.midi_channel = a[0];
-        g_settings.clock_source = a[1];
-        g_settings.out_mode     = a[2];
-        g_settings.sanitize();
+      // 3, 4 or 5 values, one layout (settings.h codec). An editor CAN switch
+      // SysEx IN off over the wire, and can never switch it back on: a
+      // switched-off IN never reaches this handler. Switching SysEx OUT off
+      // is immediate too, so even this message's own settings echo below is
+      // suppressed and the editor's confirmation is the silence itself.
+      if (settings_unpack(g_settings, a, (uint8_t)(an > SETTINGS_VALUES ? SETTINGS_VALUES : an))) {
         s_settings_req  = true;
         s_settings_dump = true;
       }
@@ -728,12 +743,35 @@ static void handle_sysex(Engine &eng, uint8_t *body, uint16_t blen) {
   }
 }
 
+// Clock from one port at a time. A master on USB and DIN at once (the MPC Live
+// sends its clock to every output) delivered each 0xF8 twice and the sequencer
+// ran at double tempo. The port that sent the last real-time byte owns clock and
+// transport; the other port's are dropped until the owner has been silent
+// CLK_SRC_HOLD_MS (the MPC sends no clock while stopped, so either port's next
+// Start takes over).
+enum : uint8_t { SRC_DIN = 0, SRC_USB = 1 };
+static constexpr uint16_t CLK_SRC_HOLD_MS = 500;
+static uint8_t  s_clk_src    = SRC_DIN;
+static uint32_t s_clk_src_ms = 0;
+static bool clk_src_owns(uint8_t src) {
+  const uint32_t now = millis();
+  if (src != s_clk_src && (uint32_t)(now - s_clk_src_ms) < CLK_SRC_HOLD_MS) return false;
+  s_clk_src = src;
+  s_clk_src_ms = now;
+  return true;
+}
+
 // System Real-Time handling, shared by the DIN and USB paths. Incoming clock
 // is echoed to MIDI OUT (both ports) so downstream gear can chase.
-static void rx_realtime(uint8_t b, MidiClockIn &mc) {
+static void rx_realtime(uint8_t b, MidiClockIn &mc, uint8_t src) {
+  if ((b == 0xF8 || b == 0xFA || b == 0xFB || b == 0xFC) && !clk_src_owns(src)) return;
   switch (b) {
     case 0xF8:
       mc.pulses++;
+      // Timestamp the byte for the uClock smoother HERE, at wire arrival, not
+      // in the loop pass that drains the count: the whole point is that the
+      // engine steps on the smoothed timebase instead of the poll cadence.
+      if (g_settings.clock_source == CLK_SRC_MIDI) uclk::OnClockByte(micros());
       if (g_settings.out_mode == OUT_MODE_OUT) {
         if (Serial1.availableForWrite() > 0) Serial1.write(b);
 #ifdef SUPEROS_USB_MIDI
@@ -741,8 +779,10 @@ static void rx_realtime(uint8_t b, MidiClockIn &mc) {
 #endif
       }
       break;
-    case 0xFA: s_transport_latch = true;  mc.started = true; break;
-    case 0xFB: s_transport_latch = true;  mc.started = true; break;
+    // Start/Continue: the next clock byte is the downbeat and must fire on
+    // arrival, so drop any owed ticks from the smoother (same rule as the 606).
+    case 0xFA: s_transport_latch = true;  mc.started = true; uclk::Reset(); break;
+    case 0xFB: s_transport_latch = true;  mc.started = true; uclk::Reset(); break;
     case 0xFC: s_transport_latch = false; mc.stopped = true; break;
     default: break;
   }
@@ -755,7 +795,9 @@ static void handle_channel_msg(Engine &eng, uint8_t status, const uint8_t *d) {
   if (!channel_ok(status)) return;
   const uint8_t type = (uint8_t)(status & 0xF0);
 
-  if (type == 0x90 && d[1] > 0) {              // Note On
+  // Note On. The NOTES IN switch (settings.h io_mask) gates only this branch:
+  // Program Change and Bank Select are pattern selection, not notes.
+  if (type == 0x90 && d[1] > 0 && g_settings.notes_in()) {
     for (uint8_t i = INST_BD; i < NUM_INSTRUMENTS; ++i)
       if (INSTRUMENT_NOTE[i] == d[0]) {
         eng.TriggerNow((uint16_t)1 << i, d[1] >= 100);
@@ -779,7 +821,7 @@ static void handle_channel_msg(Engine &eng, uint8_t status, const uint8_t *d) {
 
 static void rx_byte(Engine &eng, uint8_t b, MidiClockIn &mc) {
   // System Real-Time can interleave anywhere, including inside a SysEx.
-  if (b >= 0xF8) { rx_realtime(b, mc); return; }
+  if (b >= 0xF8) { rx_realtime(b, mc, SRC_DIN); return; }
 
   if (b == 0xF0) { s_in_sysex = true; s_rx_len = 0; return; }
   if (b == 0xF7) {
@@ -878,7 +920,7 @@ void midi_rx_poll(Engine &eng, MidiClockIn &mc) {
     if (!usbMIDI.read()) continue;  // false = empty OR SysEx continuation consumed
     const uint8_t ut = usbMIDI.getType();
     if (ut >= 0xF8) {
-      rx_realtime(ut, mc);
+      rx_realtime(ut, mc, SRC_USB);
     } else if (ut == usbMIDI.NoteOn || ut == usbMIDI.NoteOff ||
                ut == usbMIDI.ControlChange || ut == usbMIDI.ProgramChange) {
       const uint8_t status = (uint8_t)(ut | (uint8_t)(usbMIDI.getChannel() - 1));
@@ -917,7 +959,7 @@ void midi_panel_inject(uint8_t cell[4], uint8_t &status_hi) {
 #endif
 
 // Split the live scan into the nibble-per-byte 0x3C payload described above.
-// hw::ModeProbe() is sampled here rather than in the scan so it costs nothing on
+// hw::WriteEnable() is sampled here rather than in the scan so it costs nothing on
 // the ~1 ms heartbeat.
 static void build_probe(uint8_t b[PROBE_LEN]) {
   for (uint8_t i = 0; i < 4; ++i) {
@@ -925,7 +967,10 @@ static void build_probe(uint8_t b[PROBE_LEN]) {
     b[4 + i] = (uint8_t)(s_probe_cell[i] & 0x0F);          // PB — step switches
   }
   b[8] = (uint8_t)(s_probe_status & 0x0F);
-  b[9] = (uint8_t)(hw::ModeProbe() & 0x0F);
+  // [9] bit0: PC0 with PI0 HIGH (1 = the SW1b mod is fitted), bit1: PC0 with
+  // PI0 LOW (0 = SW1b write-enabled: COMPOSE, 1ST/2ND PART, PATTERN CLEAR).
+  const int8_t we = hw::WriteEnable();
+  b[9] = we < 0 ? 0 : (uint8_t)(1 | (we ? 0 : 2));
 }
 
 static void send_probe() {
@@ -980,9 +1025,12 @@ void midi_tx_service(Engine &eng) {
   // 5. Settings / panel map / info dumps.
   if (s_settings_dump) {
     s_settings_dump = false;
-    const uint8_t b[3] = { g_settings.midi_channel, g_settings.clock_source,
-                           g_settings.out_mode };
-    send_short(0x31, b, 3);
+    // Layout is the settings.h codec: each field after out_mode was APPENDED
+    // so older decoders that read three or four values are unaffected (the
+    // 606's 0x31 discipline).
+    uint8_t b[SETTINGS_VALUES];
+    settings_pack(g_settings, b);
+    send_short(0x31, b, SETTINGS_VALUES);
   }
   if (s_panelmap_dump) {
     s_panelmap_dump = false;

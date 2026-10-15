@@ -226,8 +226,16 @@ inline void PanelMap::SetDefaults() {
   inst_mask = 0x0F;
 
   // --- AUTO FILL IN (SW4) on PH3, PA0-2 -----------------------------------
-  // UNVERIFIED, same reason. Default is plain binary in panel order.
-  for (uint8_t i = 0; i < NUM_FILL_POS; ++i) fill_code[i] = i;
+  // The 1981 program's own decode, measured by running it in the host
+  // emulator (tools/d650/rtrack_probe.sh fill) and matching its compare chain
+  // at 0x217-0x26C: 0 = MANUAL, 1 = every 2, 2 = 4, 3 = 8, 4 = 12, 5 = 16
+  // (6 and 7 also mean 16 to it and are unreachable from the encoder). The
+  // lines reach this CPU exactly as they reached the uPD650C, so the table the
+  // stock machine used on this wiring is this one. The old default was plain
+  // binary in panel order, which put MANUAL on no detent and auto-filled at
+  // the MANUAL position; that is why fill_every() used to refuse it.
+  fill_code[FILL_MANUAL] = 0; fill_code[FILL_16] = 5; fill_code[FILL_12] = 4;
+  fill_code[FILL_8]      = 3; fill_code[FILL_4]  = 2; fill_code[FILL_2]  = 1;
   fill_mask = 0x07;
   ifvar_bit = 3;
 
@@ -306,15 +314,13 @@ struct Controls {
     return lookup(pa_nib(2), g_panel_map.inst_code, NUM_INSTRUMENTS,
                   g_panel_map.inst_mask, prev);
   }
-  // AUTO FILL IN is the one rotary whose codes have never been measured — the
-  // compiled table is plain binary and is a guess. A wrong guess here is not
-  // cosmetic: it silently turns auto-fill ON, and the machine drops the
-  // INTRO/FILL pattern into the middle of playback every few measures, which
-  // reads as "my pattern keeps changing to another one". Observed on hardware:
-  // the MANUAL detent reports code 5, which the binary table maps to "every 2
-  // measures". So until the table is calibrated, report MANUAL and never fill.
+  // Decoded through the stock program's own table (SetDefaults). This used to
+  // return MANUAL on any uncalibrated device, because the old binary guess
+  // auto-filled at the MANUAL detent. One hardware report said that detent
+  // reads code 5, which the stock program itself takes as "every 16": if the
+  // machine fills every 16 measures at MANUAL, read `F0 7D 3B F7` at each
+  // detent and calibrate (0x50) rather than changing this table.
   uint8_t fill_every(uint8_t prev) const {
-    if (g_panel_map.magic != PANELMAP_MAGIC) return FILL_MANUAL;
     return lookup(pa_nib(3), g_panel_map.fill_code, NUM_FILL_POS,
                   g_panel_map.fill_mask, prev);
   }
